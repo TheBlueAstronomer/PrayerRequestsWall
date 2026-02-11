@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html class="dark" lang="en"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>Submit a Prayer Request</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<script id="tailwind-config">
+        tailwind.config = {
+            darkMode: "class",
+            theme: {
+                extend: {
+                    colors: {
+                        "primary": "#13b6ec",
+                        "background-light": "#f6f8f8",
+                        "background-dark": "#101d22",
+                    },
+                    fontFamily: {
+                        "display": ["Plus Jakarta Sans"]
+                    },
+                    borderRadius: {
+                        "DEFAULT": "0.25rem",
+                        "lg": "0.5rem",
+                        "xl": "0.75rem",
+                        "full": "9999px"
+                    },
+                },
+            },
+        }
+    </script>
+<style>
+        body {
+            font-family: 'Plus Jakarta Sans', sans-serif;
+            -webkit-tap-highlight-color: transparent;
+        }
+        .ios-blur {
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+        }
+    </style>
+<style>
+        body {
+            min-height: max(884px, 100dvh);
+        }
+    </style>
+<style>
+    body {
+      min-height: max(884px, 100dvh);
+    }
+  </style>
+  </head>
+<body class="bg-background-light dark:bg-background-dark text-slate-900 dark:text-slate-100 min-h-screen flex flex-col font-display">
+<div class="h-12 w-full"></div>
+<main class="flex-1 flex flex-col px-6 max-w-md mx-auto w-full">
+<header class="pt-8 pb-10 text-center">
+<div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-primary/10 dark:bg-primary/20 mb-6">
+<span class="material-icons text-primary text-3xl">favorite</span>
+</div>
+<h1 class="text-3xl font-bold tracking-tight mb-2">You are not alone.</h1>
+<p class="text-slate-500 dark:text-slate-400 text-sm font-light">
+                Share your heart. Your request is <span class="text-primary/80 font-medium">completely anonymous</span>.
+            </p>
+</header>
+<section class="flex-1 flex flex-col">
+<div class="relative group">
+<textarea class="w-full h-64 p-5 rounded-xl bg-white dark:bg-primary/5 border border-slate-200 dark:border-primary/20 focus:border-primary focus:ring-2 focus:ring-primary/20 transition-all duration-300 resize-none text-lg leading-relaxed dark:placeholder-slate-600" maxlength="1000" placeholder="Type your prayer here..."></textarea>
+<div class="absolute bottom-4 right-4 flex items-center gap-2">
+<span class="text-xs font-medium text-slate-400 dark:text-slate-500">
+                        0 / 1000
+                    </span>
+</div>
+</div>
+<div class="mt-4 flex items-center justify-center gap-2 text-[10px] uppercase tracking-widest text-slate-400 dark:text-slate-500 font-bold">
+<span class="material-icons text-xs">lock</span>
+                100% Anonymous &amp; Private
+            </div>
+<div class="mt-auto pt-8 pb-12 flex flex-col gap-4">
+<button class="w-full bg-primary hover:bg-primary/90 text-white font-semibold py-4 rounded-xl shadow-lg shadow-primary/25 transition-transform active:scale-[0.98] flex items-center justify-center gap-2">
+                    Send Prayer Request
+                    <span class="material-icons text-sm">send</span>
+</button>
+<button class="w-full bg-transparent hover:bg-primary/10 text-primary font-medium py-3 rounded-xl transition-colors text-sm">
+                    View Prayer Wall
+                </button>
+</div>
+</section>
+</main>
+<nav class="pb-8 pt-2 px-6 border-t border-slate-100 dark:border-primary/10 ios-blur bg-white/80 dark:bg-background-dark/80 sticky bottom-0">
+<div class="flex justify-around items-center max-w-md mx-auto">
+<div class="flex flex-col items-center gap-1 text-primary flex-1">
+<span class="material-icons">add_circle</span>
+<span class="text-[10px] font-medium">Request</span>
+</div>
+<div class="flex flex-col items-center gap-1 text-slate-400 dark:text-slate-600 flex-1">
+<span class="material-icons">diversity_3</span>
+<span class="text-[10px] font-medium">Wall</span>
+</div>
+</div>
+<div class="w-32 h-1 bg-slate-300 dark:bg-slate-700 rounded-full mx-auto mt-6 opacity-30"></div>
+</nav>
+<div class="fixed inset-0 pointer-events-none -z-10 overflow-hidden opacity-20 dark:opacity-10">
+<img alt="" class="absolute top-0 left-0 w-full h-full object-cover mix-blend-overlay" data-alt="Soft ethereal blue and white gradient pattern" src="https://lh3.googleusercontent.com/aida-public/AB6AXuBbkAXpha-a97X8kD94Zp-Gti0TlAtr5v5kynUmCSjlsmR7r_TTTrfuXA5XJssR3Ns8yPoUG3DnREzjMekHWN8vJwhfdKHG-hzELi-vz7o-5MQrP_0avgJoMFaU6Ui45dulxbkRbV1vY5wQdMS6OEuLWcIHjI3bTHD91sNWRClDgOPuXs8TFkWXu7x-jjPMsgZEdFuzuvn6yiPwG8tcMs-hqIx5MRA_IVB71lMuKRMZ_Rs6JI3sfM6B9JRrbek1KUhOYDGsLnSDknU"/>
+</div>
+
+</body></html>
