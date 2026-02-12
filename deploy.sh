@@ -12,6 +12,8 @@ echo "Deployment started..."
 cd ~/PrayerRequestsWall || exit
 
 # 2. Pull the latest changes from the master branch
+echo "Resetting any local changes..."
+git reset --hard
 echo "Pulling latest changes..."
 git pull origin master
 
