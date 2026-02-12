@@ -96,7 +96,7 @@ export default function SubmitPage() {
                             </div>
                         )}
 
-                        <div className="mt-auto pt-8 pb-12 flex flex-col gap-4">
+                        <div className="mt-auto pt-8 pb-32 flex flex-col gap-4">
                             <button
                                 onClick={handleSubmit}
                                 disabled={!message.trim() || isSubmitting}

@@ -354,3 +354,16 @@ If you see an error like `Error: The browser is already running... Use a differe
     ```bash
     pm2 restart prayer-wall
     ```
+
+### Troubleshooting: ChunkLoadError or 500 Internal Server Error
+
+If you see `ChunkLoadError` or `Cannot find module` in the logs, it means the built files (`.next` folder) are missing or corrupted (usually because a deployment failed halfway).
+
+1.  **Rebuild manually:**
+    ```bash
+    cd ~/PrayerRequestsWall
+    rm -rf .next
+    npm install
+    npm run build
+    pm2 restart prayer-wall
+    ```

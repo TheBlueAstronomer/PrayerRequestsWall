@@ -17,6 +17,7 @@ jobs:
           username: ${{ secrets.GCP_USERNAME }}
           key: ${{ secrets.GCP_SSH_KEY }}
           port: 22
+          command_timeout: 30m
           script: |
             # Make the deploy script executable if it isn't already
             chmod +x ~/PrayerRequestsWall/deploy.sh
