@@ -19,6 +19,7 @@ export function PrayerCard({ request, index }: { request: PrayerRequest; index: 
         const diffInSeconds = Math.floor((now.getTime() - date.getTime()) / 1000);
 
         if (diffInSeconds < 60) {
+            // eslint-disable-next-line react-hooks/set-state-in-effect
             setTimeAgo('Just now');
             setIsNew(true);
         } else if (diffInSeconds < 3600) {
