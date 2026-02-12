@@ -7,6 +7,11 @@ set -e # Exit immediately if a command exits with a non-zero status.
 
 echo "Deployment started..."
 
+# Load NVM (Node Version Manager)
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"  # This loads nvm
+[ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"  # This loads nvm bash_completion
+
 # 1. Navigate to the project directory
 # Adjust this path if your project is located elsewhere
 cd ~/PrayerRequestsWall || exit
