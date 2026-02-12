@@ -83,7 +83,11 @@ npm install -g pm2
 Puppeteer needs certain system libraries to run headless Chrome.
 
 ```bash
-sudo apt install -y ca-certificates fonts-liberation libasound2 libatk-bridge2.0-0 libatk1.0-0 libc6 libcairo2 libcups2 libdbus-1-3 libexpat1 libfontconfig1 libgbm1 libgcc1 libglib2.0-0 libgtk-3-0 libnspr4 libpango-1.0-0 libpangocairo-1.0-0 libstdc++6 libx11-6 libx11-xcb1 libxcb1 libxcomposite1 libxcursor1 libxdamage1 libxext6 libxfixes3 libxi6 libxrandr2 libxrender1 libxss1 libxtst6 lsb-release wget xdg-utils
+# For Ubuntu 22.04 LTS (Standard):
+sudo apt install -y ca-certificates fonts-liberation libasound2 libatk-bridge2.0-0 libatk1.0-0 libc6 libcairo2 libcups2 libdbus-1-3 libexpat1 libfontconfig1 libgbm1 libgcc1 libglib2.0-0 libgtk-3-0 libnspr4 libnss3 libpango-1.0-0 libpangocairo-1.0-0 libstdc++6 libx11-6 libx11-xcb1 libxcb1 libxcomposite1 libxcursor1 libxdamage1 libxext6 libxfixes3 libxi6 libxrandr2 libxrender1 libxss1 libxtst6 lsb-release wget xdg-utils
+
+# For Ubuntu 24.04 LTS (Newer, handles t64 package renaming):
+sudo apt install -y ca-certificates fonts-liberation libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libc6 libcairo2 libcups2t64 libdbus-1-3 libexpat1 libfontconfig1 libgbm1 libgcc-s1 libglib2.0-0t64 libgtk-3-0t64 libnspr4 libnss3 libpango-1.0-0 libpangocairo-1.0-0 libstdc++6 libx11-6 libx11-xcb1 libxcb1 libxcomposite1 libxcursor1 libxdamage1 libxext6 libxfixes3 libxi6 libxrandr2 libxrender1 libxss1 libxtst6 lsb-release wget xdg-utils
 ```
 
 ---
@@ -153,7 +157,7 @@ By default, the app runs on port 3000. We want it accessible via port 80 (HTTP).
     sudo nano /etc/nginx/sites-available/prayer-wall
     ```
 
-    Paste the following (replace `your-domain.com` with your domain or the VM's External IP):
+    Paste the following. (Note: `server_name _;` is a wildcard that allows access via the VM's IP. If you have a domain, you can replace `_` with it).
 
     ```nginx
     server {
@@ -231,6 +235,7 @@ This will create `github-actions-key` (private key) and `github-actions-key.pub`
     -   `GCP_USERNAME`: The username you use to SSH into the VM (e.g., `jeffrey`).
     -   `GCP_SSH_KEY`: The **Private Key** content from `github-actions-key` (the file without an extension). Copy the entire content including `-----BEGIN RSA PRIVATE KEY-----`.
 
+
 ### 4. Push to Deploy!
 
 Now, whenever you push to `master`, GitHub Actions will:
@@ -238,3 +243,114 @@ Now, whenever you push to `master`, GitHub Actions will:
 2.  Run the `deploy.sh` script.
 3.  Pull the latest code, build, and restart the app.
 
+---
+
+## Management & Troubleshooting
+
+### How to Delete a Prayer Request from the Database
+
+You can interact with the SQLite database directly on the server.
+
+1.  **Install SQLite CLI (if not already installed):**
+    ```bash
+    sudo apt update
+    sudo apt install sqlite3
+    ```
+
+2.  **Open the Database:**
+    Navigate to the project directory:
+    ```bash
+    cd ~/PrayerRequestsWall
+    sqlite3 sqlite.db
+    ```
+
+3.  **Find the Entry ID:**
+    ```sql
+    SELECT * FROM prayer_requests;
+    ```
+
+4.  **Delete the Entry:**
+    Replace `<ID>` with the actual ID of the request you want to delete.
+    ```sql
+    DELETE FROM prayer_requests WHERE id = <ID>;
+    ```
+
+5.  **Exit:**
+    Press `Ctrl+D` or type `.exit`.
+
+### How to Reset WhatsApp Session (Login with different user)
+
+To switch WhatsApp accounts, you need to clear the saved session data.
+
+1.  **Stop the App:**
+    ```bash
+    pm2 stop prayer-wall
+    ```
+
+2.  **Delete the Session Folder:**
+    ```bash
+    rm -rf ~/PrayerRequestsWall/.wwebjs_auth
+    ```
+
+3.  **Restart and Re-scan:**
+    It's easiest to run manually to scan the new QR code:
+    ```bash
+    cd ~/PrayerRequestsWall
+    npm run start
+    ```
+    scan the QR code, then `Ctrl+C` to stop.
+
+4.  **Restart PM2:**
+    ```bash
+    pm2 restart prayer-wall
+    ```
+
+### How to Update Environment Variables (Without pushing code)
+
+Since `.env` is ignored by Git, you can update it directly on the server.
+
+1.  **Edit the file:**
+    ```bash
+    nano ~/PrayerRequestsWall/.env
+    ```
+
+2.  **Update the values** (e.g., change `WHATSAPP_GROUP_ID`).
+
+3.  **Save and Exit:**
+    Press `Ctrl+O`, `Enter` to save, then `Ctrl+X` to exit.
+
+4.  **Restart the App:**
+    For the changes to take effect, restart the application:
+    ```bash
+    pm2 restart prayer-wall
+    ```
+
+
+### Troubleshooting: Browser Already Running / Session Locked
+
+If you see an error like `Error: The browser is already running... Use a different userDataDir`, it means a previous process didn't close correctly and is locking the session.
+
+1.  **Check for running processes:**
+    ```bash
+    ps aux | grep -E "chrome|chromium|node"
+    ```
+    If you see lines ending in `chrome` or `node` (other than your current shell), they might be the culprit.
+
+2.  **Kill all Chrome/Puppeteer processes:**
+    ```bash
+    sudo pkill -f chrome
+    sudo pkill -f chromium
+    # BE CAREFUL: This kills all node processes. Only do this if you are sure.
+    # sudo pkill -f node
+    ```
+
+3.  **Nuclear Option: Remove the Lock File manually:**
+    If processes are dead but it still fails, the lock file is stale. Delete it:
+    ```bash
+    rm -rf ~/PrayerRequestsWall/.wwebjs_auth/session/SingletonLock
+    ```
+
+4.  **Restart your app:**
+    ```bash
+    pm2 restart prayer-wall
+    ```
