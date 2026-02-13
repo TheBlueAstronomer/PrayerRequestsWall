@@ -59,7 +59,7 @@ The project is containerized, which is the easiest way to run it and matches the
     ```bash
     docker-compose up
     ```
-2.  Open [http://localhost:3000](http://localhost:3000).
+2.  Open [http://localhost](http://localhost).
 3.  **WhatsApp Auth**: Watch the terminal logs. A QR code will appear. Scan it with your WhatsApp mobile app to link the bot.
 
 ### Running Locally (Manual / Legacy)

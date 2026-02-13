@@ -15,7 +15,7 @@ fi
 DB_FILE="${HOST_DATA_PATH}/sqlite.db"
 BACKUP_DIR="${HOST_DATA_PATH}/backups"
 APP_SERVICE_NAME="app"             
-HEALTH_URL="http://127.0.0.1:3000/api/health"
+HEALTH_URL="http://127.0.0.1:80/api/health"
 HEALTH_RETRIES=12
 HEALTH_INTERVAL=5
 # ---------------------------------------------------
