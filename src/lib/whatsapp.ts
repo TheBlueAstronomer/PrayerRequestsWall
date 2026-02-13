@@ -15,7 +15,18 @@ class WhatsAppService {
         this.client = new Client({
             authStrategy: new LocalAuth(),
             puppeteer: {
-                args: ['--no-sandbox', '--disable-setuid-sandbox'],
+                handleSIGINT: false,
+                args: [
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-accelerated-2d-canvas',
+                    '--no-first-run',
+                    '--no-zygote',
+                    '--disable-gpu'
+                ],
+                // Increase timeout for slow environments checks
+                protocolTimeout: 120000,
             },
         });
 
@@ -24,19 +35,9 @@ class WhatsAppService {
             qrcode.generate(qr, { small: true });
         });
 
-        this.client.on('ready', async () => {
+        this.client.on('ready', () => {
             console.log('WhatsApp Client is ready!');
             this.isReady = true;
-            try {
-                const chats = await this.client.getChats();
-                const groups = chats.filter(chat => chat.isGroup);
-                console.log('Available Groups:');
-                groups.forEach(group => {
-                    console.log(`- Name: ${group.name}, ID: ${group.id._serialized}`);
-                });
-            } catch (error) {
-                console.error('Error fetching chats:', error);
-            }
         });
 
         this.client.on('authenticated', () => {
