@@ -34,11 +34,11 @@ steps:
       - '-c'
       - |
         IMAGE_URL="${_ARTIFACT_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:$SHORT_SHA"
-        echo "Deploying $IMAGE_URL to VM ${_VM_NAME} in ${_VM_ZONE}..."
+        echo "Deploying $$IMAGE_URL to VM ${_VM_NAME} in ${_VM_ZONE}..."
 
         gcloud compute ssh ${_VM_NAME} --zone=${_VM_ZONE} --command="
           cd PrayerRequestsWall &&
-          export DEPLOY_IMAGE=\"${IMAGE_URL}\" &&
+          export DEPLOY_IMAGE=\"$${IMAGE_URL}\" &&
           export HOST_DATA_PATH='/var/intercessor/data' &&
           ./deploy-docker.sh
         "
