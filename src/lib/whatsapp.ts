@@ -58,11 +58,13 @@ class WhatsAppService {
     }
 }
 
-// Singleton pattern to prevent multiple instances during HMR
-const whatsappService = global.whatsappGlobal || new WhatsAppService();
-
-if (process.env.NODE_ENV !== 'production') {
-    global.whatsappGlobal = whatsappService;
+// Singleton pattern to prevent multiple instances
+// We attach to global to survive Next.js HMR and to prevent double-init in production
+// when both server.ts and Next.js bundle import this module.
+if (!global.whatsappGlobal) {
+    global.whatsappGlobal = new WhatsAppService();
 }
+
+const whatsappService = global.whatsappGlobal;
 
 export { whatsappService };
