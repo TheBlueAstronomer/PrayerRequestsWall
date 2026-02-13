@@ -45,6 +45,7 @@ next-env.d.ts
 
 # whatsapp-web.js auth
 .wwebjs_auth
+.wwebjs_auth.zip
 .wwebjs_cache
 
 # database

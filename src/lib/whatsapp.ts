@@ -14,6 +14,8 @@ class WhatsAppService {
         console.log('Initializing WhatsApp Client...');
         this.client = new Client({
             authStrategy: new LocalAuth(),
+            authTimeoutMs: 60000,
+            qrMaxRetries: 0,
             puppeteer: {
                 handleSIGINT: false,
                 args: [

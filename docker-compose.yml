@@ -1,0 +1,16 @@
+services:
+  app:
+    # Always use the image passed from deploy script/CI
+    image: ${DEPLOY_IMAGE}
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      # Use HOST_DATA_PATH if set (prod), else default to current dir (dev)
+      - ${HOST_DATA_PATH:-.}/.wwebjs_auth:/app/.wwebjs_auth
+      - ${HOST_DATA_PATH:-.}/.wwebjs_cache:/app/.wwebjs_cache
+      - ${HOST_DATA_PATH:-.}/sqlite.db:/app/sqlite.db
+    environment:
+      - NODE_ENV=production
+    env_file:
+      - .env

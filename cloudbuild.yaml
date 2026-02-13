@@ -1,0 +1,51 @@
+substitutions:
+  _ARTIFACT_REGION: "asia-south1"
+  _REPOSITORY: "prayer-repository"
+  _IMAGE_NAME: "prayer-wall-app"
+  _VM_NAME: "project-intercessor"
+  _VM_ZONE: "asia-south1-a"
+
+steps:
+  # 1. Build the container image with Commit SHA tag
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - '${_ARTIFACT_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:$SHORT_SHA'
+      - '-t'
+      - '${_ARTIFACT_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:latest'
+      - '.'
+
+  # 2. Push the container image (both tags)
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - '${_ARTIFACT_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:$SHORT_SHA'
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - '${_ARTIFACT_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:latest'
+
+  # 3. SSH into VM and deploy specific version
+  - name: 'gcr.io/cloud-builders/gcloud'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        IMAGE_URL="${_ARTIFACT_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:$SHORT_SHA"
+        echo "Deploying $IMAGE_URL to VM ${_VM_NAME} in ${_VM_ZONE}..."
+
+        gcloud compute ssh ${_VM_NAME} --zone=${_VM_ZONE} --command="
+          cd PrayerRequestsWall &&
+          export DEPLOY_IMAGE=\"${IMAGE_URL}\" &&
+          export HOST_DATA_PATH='/var/intercessor/data' &&
+          ./deploy-docker.sh
+        "
+
+images:
+  - '${_ARTIFACT_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:$SHORT_SHA'
+  - '${_ARTIFACT_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:latest'
+
+options:
+  logging: CLOUD_LOGGING_ONLY

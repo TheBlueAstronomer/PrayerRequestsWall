@@ -31,6 +31,7 @@ Project Intercessor is a digital safe haven for youth group members to share pra
 ### Prerequisites
 
 -   Node.js 20+ installed.
+-   [Docker Desktop](https://www.docker.com/products/docker-desktop/) (Recommended for easiest setup).
 
 ### Installation
 
@@ -40,17 +41,45 @@ Project Intercessor is a digital safe haven for youth group members to share pra
     cd PrayerRequestsWall
     ```
 
-2.  Install dependencies:
+2.  Create your `.env` file:
+    ```bash
+    cp .env.example .env
+    # Edit .env with your credentials
+    ```
+
+3.  Create local data directory (Required for Docker):
+    ```bash
+    mkdir data
+    ```
+
+### Running Locally (Docker - Recommended)
+The project is containerized, which is the easiest way to run it and matches the production environment.
+
+1.  Start the application:
+    ```bash
+    docker-compose up
+    ```
+2.  Open [http://localhost:3000](http://localhost:3000).
+3.  **WhatsApp Auth**: Watch the terminal logs. A QR code will appear. Scan it with your WhatsApp mobile app to link the bot.
+
+### Running Locally (Manual / Legacy)
+If you prefer running without Docker:
+
+1.  Install dependencies:
     ```bash
     npm install
     ```
 
-3.  Set up the database:
+2.  Set up the database:
     ```bash
     npm run db:push
     ```
 
-### Running the Application
+3.  Run the server:
+    ```bash
+    npm run dev:custom
+    ```
+    (See "Full Application" below for details).
 
 This project supports two modes of operation:
 
@@ -93,8 +122,6 @@ npm run dev:custom
 -   `drizzle.config.ts`: Configuration for Drizzle ORM.
 -   `PRD.md`: Detailed Product Requirements Document.
 
-## Deployment Notes
+## Deployment
 
-For deployment (e.g., on AWS EC2):
-1.  Ensure you have a swap file enabled (recommended 2GB) as Puppeteer/Chrome can be memory intensive.
-2.  Use a process manager like PM2 to keep the `server.ts` process alive.
+See **[DEPLOYMENT.md](DEPLOYMENT.md)** for a complete guide on deploying this application to Google Cloud Platform (GCP) using Cloud Build, Artifact Registry, and Compute Engine.

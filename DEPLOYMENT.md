@@ -1,369 +1,225 @@
-# Deploying Prayer Requests Wall to Google Cloud (Free Tier)
+# Deploying Prayer Requests Wall (Automated)
 
-This guide covers how to deploy the "Prayer Requests Wall" application to a Google Cloud Platform (GCP) **e2-micro** instance, which is part of the [GCP Free Tier](https://cloud.google.com/free).
-
-Because this application requires a persistent connection for WhatsApp (via Puppeteer/Chrome), we cannot use serverless platforms like Vercel or Cloud Run easily. A Virtual Machine (VM) is the best choice.
-
-## Prerequisites
-
-1.  A Google Cloud Platform Account.
-2.  A project created in the Google Cloud Console.
-3.  Basic familiarity with the terminal.
+This guide covers the **fully automated** deployment pipeline using `gcloud compute ssh`.
+Pushing to `master` will Build -> Push -> SSH (via IAM) -> Deploy.
 
 ---
 
-## Step 1: Create the VM Instance
+## Part 1: Infrastructure Setup
 
-1.  Navigate to **Compute Engine** > **VM instances** in the Google Cloud Console.
-2.  Click **Create Instance**.
-3.  **Name:** `prayer-wall-server` (or any name you prefer).
-4.  **Region:** Choose a Free Tier eligible region (usually `us-central1`, `us-west1`, or `us-east1`).
-5.  **Machine Configuration:**
-    -   Series: **E2**
-    -   Machine type: **e2-micro** (2 vCPU, 1 GB memory).
-6.  **Boot Disk:**
-    -   Click **Change**.
-    -   Operating System: **Ubuntu**
-    -   Version: **Ubuntu 22.04 LTS** (or 24.04 LTS)
-    -   Boot disk type: **Standard persistent disk** (up to 30GB is free). Set it to **20GB** to be safe.
-7.  **Firewall:**
-    -   Check **Allow HTTP traffic**.
-    -   Check **Allow HTTPS traffic**.
-8.  Click **Create**.
+### 1. Create the VM
+- **Name**: `project-intercessor`
+- **Region/Zone**: `asia-south1-a` (or any zone in Mumbai).
+- **Machine Type**: **e2-small** (2 vCPU, 2GB RAM).
+- **OS**: Ubuntu 24.04 LTS.
+- **Firewall**: Allow HTTP/HTTPS.
+- **Service Account**: "Compute Engine default service account" with access to **Artifact Registry** (Storage Object Viewer).
 
----
-
-## Step 2: Configure the Server
-
-Once the instance is running, click the **SSH** button next to it to open a terminal.
-
-### 2.1. Update System & Install Dependencies
-Run the following commands to update the system and install necessary tools:
-
+### 2. Configure the VM
+SSH into the VM and run:
 ```bash
-sudo apt update && sudo apt upgrade -y
-sudo apt install -y curl git unzip build-essential
-```
+# Update and install Docker
+sudo apt update && sudo apt install -y docker.io docker-compose git
 
-### 2.2. Create a Swap File (CRITICAL)
-The `e2-micro` instance only has 1GB of RAM. Puppeteer (Chrome) can eat this up quickly. We MUST create a swap file to prevent crashes.
+# Enable Docker for current user
+sudo usermod -aG docker $USER
+newgrp docker
 
-```bash
-# Create a 2GB swap file
+# Configure Swap (CRITICAL for <2GB RAM)
 sudo fallocate -l 2G /swapfile
 sudo chmod 600 /swapfile
 sudo mkswap /swapfile
 sudo swapon /swapfile
-
-# Make it permanent
 echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+
+# Install Google Cloud SDK (Required for gcloud auth)
+sudo apt-get install -y apt-transport-https ca-certificates gnupg curl
+curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | sudo tee -a /etc/apt/sources.list.d/google-cloud-sdk.list
+sudo apt-get update && sudo apt-get install -y google-cloud-cli
+
+# Configure Docker to verify images from Artifact Registry
+gcloud auth configure-docker asia-south1-docker.pkg.dev
+
+# Create Persistent Data Directories (CRITICAL)
+# This allows us to use absolute paths in the deployment script
+sudo mkdir -p /var/intercessor/data /var/intercessor/data/backups
+# Set ownership to your user (or the user docker runs as). 
+# If your container runs as UID 1000 (standard), use:
+sudo chown -R 1000:1000 /var/intercessor
+# Otherwise, chown to your current user:
+# sudo chown -R $USER:$USER /var/intercessor
 ```
 
-### 2.3. Install Node.js (via NVM)
-We need Node.js 20+.
-
-```bash
-# Install NVM
-curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
-
-# Activate NVM (or restart terminal)
-export NVM_DIR="$HOME/.nvm"
-[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
-
-# Install Node 20
-nvm install 20
-nvm use 20
-nvm alias default 20
-
-# Install PM2 (Process Manager)
-npm install -g pm2
-```
-
-### 2.4. Install Chrome Dependencies for Puppeteer
-Puppeteer needs certain system libraries to run headless Chrome.
-
-```bash
-# For Ubuntu 22.04 LTS (Standard):
-sudo apt install -y ca-certificates fonts-liberation libasound2 libatk-bridge2.0-0 libatk1.0-0 libc6 libcairo2 libcups2 libdbus-1-3 libexpat1 libfontconfig1 libgbm1 libgcc1 libglib2.0-0 libgtk-3-0 libnspr4 libnss3 libpango-1.0-0 libpangocairo-1.0-0 libstdc++6 libx11-6 libx11-xcb1 libxcb1 libxcomposite1 libxcursor1 libxdamage1 libxext6 libxfixes3 libxi6 libxrandr2 libxrender1 libxss1 libxtst6 lsb-release wget xdg-utils
-
-# For Ubuntu 24.04 LTS (Newer, handles t64 package renaming):
-sudo apt install -y ca-certificates fonts-liberation libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libc6 libcairo2 libcups2t64 libdbus-1-3 libexpat1 libfontconfig1 libgbm1 libgcc-s1 libglib2.0-0t64 libgtk-3-0t64 libnspr4 libnss3 libpango-1.0-0 libpangocairo-1.0-0 libstdc++6 libx11-6 libx11-xcb1 libxcb1 libxcomposite1 libxcursor1 libxdamage1 libxext6 libxfixes3 libxi6 libxrandr2 libxrender1 libxss1 libxtst6 lsb-release wget xdg-utils
-```
-
----
-
-## Step 3: Deploy the Application
-
-### 3.1. Clone the Repository
-Replace `<YOUR_REPO_URL>` with your actual GitHub repository URL.
-
+### 3. Setup Project on VM
 ```bash
 git clone <YOUR_REPO_URL>
 cd PrayerRequestsWall
+nano .env
 ```
-
-### 3.2. Install Dependencies & Build
-```bash
-npm install
-npm run build
-```
-
-### 3.3. Database Setup (SQLite)
-Since we are using SQLite, the database is a file.
-Initialize the database:
-```bash
-npm run db:push
-```
-
-### 3.4. Start with PM2
-We use PM2 to keep the app running in the background.
-
-```bash
-# Start the app using the 'start' script which runs 'tsx server.ts'
-pm2 start npm --name "prayer-wall" -- run start
-```
-
-### 3.5. WhatsApp Authentication (First Run)
-To authenticate WhatsApp, we need to see the QR code. PM2 logs will show it, but it might be messy. The easiest way for the **first run** is to stop PM2, run manually, authenticate, then restart PM2.
-
-```bash
-# Stop PM2 temporarily
-pm2 stop prayer-wall
-
-# Run manually to scan QR code
-npm run start
-```
-**Scan the QR code** with your phone. Once you see "Ready on http://localhost:3000" and "Client is ready!", press `Ctrl+C` to stop it. The session is now saved in `.wwebjs_auth`.
-
-```bash
-# Restart PM2
-pm2 restart prayer-wall
-```
+Paste your `.env` content.
+**Note**: You do **NOT** need to set `DOCKER_IMAGE_URL` or `DEPLOY_IMAGE` here. Cloud Build injects it automatically.
 
 ---
 
-## Step 4: Configure Nginx (Reverse Proxy)
+## Part 2: Cloud Build & Permissions
 
-By default, the app runs on port 3000. We want it accessible via port 80 (HTTP).
+This is the "Magic" part. We use Google's IAM to let Cloud Build SSH into the VM without managing keys.
 
-1.  **Install Nginx:**
-    ```bash
-    sudo apt install -y nginx
-    ```
+### 1. Create Artifact Registry Repository
+- **Name**: `prayer-repository`
+- **Format**: Docker
+- **Region**: `asia-south1` (Mumbai)
 
-2.  **Configure Nginx:**
-    Create a configuration file for your app.
-    ```bash
-    sudo nano /etc/nginx/sites-available/prayer-wall
-    ```
+### 2. Grant Permissions to Cloud Build
+1.  Go to **Cloud Build** > **Settings**.
+2.  Copy the **Service Account Email** (`[PROJECT-NUMBER]@cloudbuild.gserviceaccount.com`).
+3.  Go to **IAM & Admin** > **IAM**.
+4.  Find that email (or "Grant Access").
 
-    Paste the following. (Note: `server_name _;` is a wildcard that allows access via the VM's IP. If you have a domain, you can replace `_` with it).
+5.  Add the role: **Artifact Registry Writer**.
+    *   *Why?* Allows Cloud Build to push images to the registry.
+6.  Add the role: **Compute OS Login**.
+    *   *Why?* Allows Cloud Build to SSH into your VM using least-privilege.
+7.  *(Optional)* Add the role: **Service Account User**.
+    *   *Why?* Only needed if Cloud Build performs actions *as* the VM's service account (impersonation). Not strictly required for just SSH if OS Login is fully configured.
 
-    ```nginx
-    server {
-        listen 80;
-        server_name _;  # Or your domain name
+### 3. Grant Permissions to VM Service Account
+1.  Go to **IAM & Admin** > **IAM**.
+2.  Find the **Compute Engine default service account** (or whichever SA your VM uses).
+3.  Add the role: **Artifact Registry Reader**.
+    *   *Why?* Allows the VM to pull images without `gcloud auth login`.
 
-        location / {
-            proxy_pass http://localhost:3000;
-            proxy_http_version 1.1;
-            proxy_set_header Upgrade $http_upgrade;
-            proxy_set_header Connection 'upgrade';
-            proxy_set_header Host $host;
-            proxy_cache_bypass $http_upgrade;
-        }
-    }
-    ```
+### 4. Enable OS Login
+For Cloud Build to SSH via OS Login, it must be enabled.
+1.  **Project-wide** (Recommended):
+    Go to **Compute Engine** > **Metadata**. Add `enable-oslogin` = `TRUE`.
+2.  **Or Per-VM**:
+    Edit your VM instance > **Custom Metadata**. Add `enable-oslogin` = `TRUE`.
 
-3.  **Enable the Site:**
-    ```bash
-    sudo ln -s /etc/nginx/sites-available/prayer-wall /etc/nginx/sites-enabled/
-    sudo rm /etc/nginx/sites-enabled/default  # Remove default welcome page
-    sudo nginx -t  # Test configuration
-    sudo systemctl restart nginx
-    ```
-
-## Done!
-Access your application via the VM's External IP address (found in Google Cloud Console).
+### 3. Configure Cloud Build Trigger
+1.  Go to **Cloud Build** > **Triggers**.
+2.  Create Trigger:
+    -   **Name**: `deploy-production`
+    -   **Event**: Push to branch `master`.
+    -   **Source**: Your GitHub Repo.
+    -   **Configuration**: `cloudbuild.yaml`.
+3.  **Substitutions** (Crucial Step):
+    You must match the variables in `cloudbuild.yaml` or override them here:
+    -   `_VM_ZONE`: **MUST MATCH** your VM's zone (e.g., `asia-south1-a`).
+    -   `_VM_NAME`: `project-intercessor`.
 
 ---
 
-## Maintenance
+## Part 3: Deploy!
 
--   **View Logs:** `pm2 logs prayer-wall`
--   **Restart App:** `pm2 restart prayer-wall`
--   **Update App:**
+Push to master:
+```bash
+git add .
+git commit -m "Configure auto-deploy"
+git push origin master
+```
+
+### How it works
+1.  **Build**: Creates docker image tagged with the Git Commit SHA (e.g., `:a1b2c3d`).
+2.  **Push**: Uploads to Artifact Registry.
+3.  **SSH**: Cloud Build uses its IAM role to create a temporary SSH key, connects to the VM, and runs:
+    ```bash
+    export DOCKER_IMAGE_URL=...:a1b2c3d
+    ./deploy-docker.sh
+    ```
+4.  **Update**: The script pulls the specific image, backs up the database, and restarts the container.
+    *   *Note*: The VM does **not** `git pull` code. It runs exactly what was built in Cloud Build.
+
+---
+
+---
+
+---
+
+## Part 4: WhatsApp Authentication (First Run Only)
+
+After your first deployment, the app will start but won't be connected to WhatsApp yet. You need to scan the QR code.
+
+1.  **SSH into the VM**:
+    Go to GCP Console > Compute Engine > VM Instances > click **SSH** next to `project-intercessor`.
+
+2.  **View the Logs**:
+    Run this command to see the real-time logs of your app:
     ```bash
     cd PrayerRequestsWall
-    git pull
-    npm install
-    npm run build
-    pm2 restart prayer-wall
+    docker-compose logs -f app
+    ```
+
+3.  **Scan the QR Code**:
+    -   You will see a QR code generated in the terminal (it might take a moment to appear).
+    -   Open WhatsApp on your phone > Linked Devices > **Link a Device**.
+    -   Scan the code on your screen.
+
+4.  **Verification**:
+    -   The logs should say "Client is ready!".
+    -   **Persistence**: The session is now saved to `/var/intercessor/data/.wwebjs_auth`. You won't need to scan again for future deployments unless you explicitly delete that folder.
+
+---
+
+## Part 5: Managing the Database
+
+Since the database is a standard SQLite file stored on the VM at `/var/intercessor/data/sqlite.db`, you can access it directly to inspect data or manually delete entries.
+
+1.  **SSH into the VM**:
+    ```bash
+    gcloud compute ssh project-intercessor --zone asia-south1-a
+    ```
+
+2.  **Install SQLite3 Tool** (Run once):
+    ```bash
+    sudo apt update && sudo apt install -y sqlite3
+    ```
+
+3.  **Open the Database**:
+    ```bash
+    sqlite3 /var/intercessor/data/sqlite.db
+    ```
+
+4.  **Run SQL Commands**:
+    ```sql
+    -- List all tables
+    .tables
+
+    -- See the last 5 prayer requests
+    SELECT id, content, created_at FROM prayer_requests ORDER BY created_at DESC LIMIT 5;
+
+    -- Delete a specific request by ID
+    DELETE FROM prayer_requests WHERE id = 123;
+
+    -- Exit the tool
+    .quit
     ```
 
 ---
 
-## Continuous Deployment (CI/CD)
+## Security Best Practices
 
-We have set up a GitHub Actions workflow that automatically deploys changes to your server whenever you push to the `master` branch.
-
-### 1. Generate an SSH Key Pair
-
-On your local machine (not the server), generate a new SSH key specifically for GitHub Actions:
-
-```bash
-ssh-keygen -t rsa -b 4096 -C "github-actions" -f ./github-actions-key
-```
-This will create `github-actions-key` (private key) and `github-actions-key.pub` (public key).
-
-### 2. Add Public Key to the Server
-
-1.  Copy the content of `github-actions-key.pub`.
-2.  SSH into your Google Cloud server.
-3.  Add the key to `authorized_keys`:
+1.  **Session Data Permissions**:
+    The `.wwebjs_auth` folder contains sensitive WhatsApp session data. Lock it down on the VM:
     ```bash
-    nano ~/.ssh/authorized_keys
-    # Paste the key on a new line, save and exit.
+    chmod -R 700 .wwebjs_auth
     ```
 
-### 3. Add Secrets to GitHub
-
-1.  Go to your GitHub Repository > **Settings** > **Secrets and variables** > **Actions**.
-2.  Click **New repository secret**.
-3.  Add the following secrets:
-    -   `GCP_HOST`: The External IP address of your VM.
-    -   `GCP_USERNAME`: The username you use to SSH into the VM (e.g., `jeffrey`).
-    -   `GCP_SSH_KEY`: The **Private Key** content from `github-actions-key` (the file without an extension). Copy the entire content including `-----BEGIN RSA PRIVATE KEY-----`.
-
-
-### 4. Push to Deploy!
-
-Now, whenever you push to `master`, GitHub Actions will:
-1.  SSH into your server.
-2.  Run the `deploy.sh` script.
-3.  Pull the latest code, build, and restart the app.
+2.  **Environment Variables**:
+    Ensure your `.env` file is only readable by the owner:
+    ```bash
+    chmod 600 .env
+    ```
 
 ---
 
-## Management & Troubleshooting
+## Troubleshooting
 
-### How to Delete a Prayer Request from the Database
-
-You can interact with the SQLite database directly on the server.
-
-1.  **Install SQLite CLI (if not already installed):**
-    ```bash
-    sudo apt update
-    sudo apt install sqlite3
-    ```
-
-2.  **Open the Database:**
-    Navigate to the project directory:
-    ```bash
-    cd ~/PrayerRequestsWall
-    sqlite3 sqlite.db
-    ```
-
-3.  **Find the Entry ID:**
-    ```sql
-    SELECT * FROM prayer_requests;
-    ```
-
-4.  **Delete the Entry:**
-    Replace `<ID>` with the actual ID of the request you want to delete.
-    ```sql
-    DELETE FROM prayer_requests WHERE id = <ID>;
-    ```
-
-5.  **Exit:**
-    Press `Ctrl+D` or type `.exit`.
-
-### How to Reset WhatsApp Session (Login with different user)
-
-To switch WhatsApp accounts, you need to clear the saved session data.
-
-1.  **Stop the App:**
-    ```bash
-    pm2 stop prayer-wall
-    ```
-
-2.  **Delete the Session Folder:**
-    ```bash
-    rm -rf ~/PrayerRequestsWall/.wwebjs_auth
-    ```
-
-3.  **Restart and Re-scan:**
-    It's easiest to run manually to scan the new QR code:
-    ```bash
-    cd ~/PrayerRequestsWall
-    npm run start
-    ```
-    scan the QR code, then `Ctrl+C` to stop.
-
-4.  **Restart PM2:**
-    ```bash
-    pm2 restart prayer-wall
-    ```
-
-### How to Update Environment Variables (Without pushing code)
-
-Since `.env` is ignored by Git, you can update it directly on the server.
-
-1.  **Edit the file:**
-    ```bash
-    nano ~/PrayerRequestsWall/.env
-    ```
-
-2.  **Update the values** (e.g., change `WHATSAPP_GROUP_ID`).
-
-3.  **Save and Exit:**
-    Press `Ctrl+O`, `Enter` to save, then `Ctrl+X` to exit.
-
-4.  **Restart the App:**
-    For the changes to take effect, restart the application:
-    ```bash
-    pm2 restart prayer-wall
-    ```
-
-
-### Troubleshooting: Browser Already Running / Session Locked
-
-If you see an error like `Error: The browser is already running... Use a different userDataDir`, it means a previous process didn't close correctly and is locking the session.
-
-1.  **Check for running processes:**
-    ```bash
-    ps aux | grep -E "chrome|chromium|node"
-    ```
-    If you see lines ending in `chrome` or `node` (other than your current shell), they might be the culprit.
-
-2.  **Kill all Chrome/Puppeteer processes:**
-    ```bash
-    sudo pkill -f chrome
-    sudo pkill -f chromium
-    # BE CAREFUL: This kills all node processes. Only do this if you are sure.
-    # sudo pkill -f node
-    ```
-
-3.  **Nuclear Option: Remove the Lock File manually:**
-    If processes are dead but it still fails, the lock file is stale. Delete it:
-    ```bash
-    rm -rf ~/PrayerRequestsWall/.wwebjs_auth/session/SingletonLock
-    ```
-
-4.  **Restart your app:**
-    ```bash
-    pm2 restart prayer-wall
-    ```
-
-### Troubleshooting: ChunkLoadError or 500 Internal Server Error
-
-If you see `ChunkLoadError` or `Cannot find module` in the logs, it means the built files (`.next` folder) are missing or corrupted (usually because a deployment failed halfway).
-
-1.  **Rebuild manually:**
-    ```bash
-    cd ~/PrayerRequestsWall
-    rm -rf .next
-    npm install
-    npm run build
-    pm2 restart prayer-wall
-    ```
+-   **"Insufficient Permission"**:
+    -   Check that Cloud Build SA has `roles/compute.osLogin` and `roles/artifactregistry.writer`.
+    -   Ensure OS Login is enabled on the VM (`enable-oslogin=TRUE`).
+    -   Ensure the VM Zone in the Trigger matches the actual VM.
+    -   **DO NOT** grant `roles/compute.instanceAdmin.v1` unless absolutely necessary.
+-   **"Zone mismatch"**: Ensure `_VM_ZONE` in Cloud Build Trigger matches the VM's actual zone.
+-   **Application Error**: Check VM logs: `docker-compose logs -f app`.

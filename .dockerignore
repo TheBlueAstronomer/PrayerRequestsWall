@@ -1,0 +1,14 @@
+node_modules
+.next
+.git
+.wwebjs_auth
+.wwebjs_cache
+sqlite.db
+sqlite.db-journal
+Dockerfile
+docker-compose.yml
+.env
+README.md
+DEPLOYMENT.md
+PRD.md
+mockups
