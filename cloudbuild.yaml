@@ -27,29 +27,52 @@ steps:
       - 'push'
       - '${_ARTIFACT_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:latest'
 
-  # 3. SSH into VM and deploy specific version
+        # ---------------------------------------
+        # Upload latest deployment script to VM
+        # ---------------------------------------
   - name: 'gcr.io/cloud-builders/gcloud'
+    id: 'upload-deploy-script'
     entrypoint: 'bash'
     args:
       - '-c'
       - |
-        IMAGE="us-central1-docker.pkg.dev/PROJECT_ID/prayer-repository/prayer-wall:$SHORT_SHA"
-        # Since we use asia-south1, we should stick to it unless you INTENDED to switch to us-central1.
-        # However, to be safe and use existing vars:
+        set -euo pipefail
+
+        echo "Uploading deploy-docker.sh to VM..."
+
+        gcloud compute scp deploy-docker.sh \
+          ${_VM_NAME}:/tmp/deploy-docker.sh \
+          --zone=${_VM_ZONE}
+
+        gcloud compute ssh ${_VM_NAME} \
+          --zone=${_VM_ZONE} \
+          --command "sudo mv /tmp/deploy-docker.sh /opt/deploy/deploy-docker.sh && \
+                     sudo chown root:root /opt/deploy/deploy-docker.sh && \
+                     sudo chmod 755 /opt/deploy/deploy-docker.sh"
+
+  # ---------------------------------------
+  # Execute deployment
+  # ---------------------------------------
+  - name: 'gcr.io/cloud-builders/gcloud'
+    id: 'run-deploy'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        set -euo pipefail
+
+        # Define the image path (using built-in project ID variable)
         IMAGE="${_ARTIFACT_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:$SHORT_SHA"
-        
-        # Upload deploy scripts to VM (run this in cloudbuild.yaml)
-        # Upload deploy scripts to VM (run this in cloudbuild.yaml)
-        echo "Uploading deploy scripts..."
-        # copy the script to the VM
-        gcloud compute scp --zone=${_VM_ZONE} "deploy-docker.sh" "${_VM_NAME}:/opt/deploy/deploy-docker.sh"
-        # make executable and set safe perms (owned by root, executable by all)
-        gcloud compute ssh "${_VM_NAME}" --zone=${_VM_ZONE} --command "sudo chown root:root /opt/deploy/deploy-docker.sh && sudo chmod 755 /opt/deploy/deploy-docker.sh"
 
-        # Execute deployment remotely
-        echo "Executing remote deployment..."
-        gcloud compute ssh "${_VM_NAME}" --zone="${_VM_ZONE}" --command "export DEPLOY_IMAGE='${IMAGE}' && export HOST_DATA_PATH='/var/intercessor/data' && /opt/deploy/deploy-docker.sh"
+        echo "Deploying image: $$IMAGE"
 
+        # Execute the deployment script on the VM
+        # Note: We escape $$IMAGE so the shell sees the variable value, not Cloud Build substitution
+        gcloud compute ssh ${_VM_NAME} \
+          --zone=${_VM_ZONE} \
+          --command "export DEPLOY_IMAGE='$$IMAGE' && \
+                     export HOST_DATA_PATH='/var/intercessor/data' && \
+                     /opt/deploy/deploy-docker.sh"
 images:
   - '${_ARTIFACT_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:$SHORT_SHA'
   - '${_ARTIFACT_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:latest'
