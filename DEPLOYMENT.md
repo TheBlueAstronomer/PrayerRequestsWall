@@ -9,7 +9,7 @@ Pushing to `master` will Build -> Push -> SSH (via IAM) -> Deploy.
 
 ### 1. Create the VM
 - **Name**: `project-intercessor`
-- **Region/Zone**: `asia-south1-a` (or any zone in Mumbai).
+- **Region/Zone**: `asia-south1-c` (or any zone in Mumbai).
 - **Machine Type**: **e2-small** (2 vCPU, 2GB RAM).
 - **OS**: Ubuntu 24.04 LTS.
 - **Firewall**: Allow HTTP/HTTPS.
@@ -106,7 +106,7 @@ For Cloud Build to SSH via OS Login, it must be enabled.
     -   **Configuration**: `cloudbuild.yaml`.
 3.  **Substitutions** (Crucial Step):
     You must match the variables in `cloudbuild.yaml` or override them here:
-    -   `_VM_ZONE`: **MUST MATCH** your VM's zone (e.g., `asia-south1-a`).
+    -   `_VM_ZONE`: **MUST MATCH** your VM's zone (e.g., `asia-south1-c`).
     -   `_VM_NAME`: `project-intercessor`.
 
 ---
@@ -168,7 +168,7 @@ Since the database is a standard SQLite file stored on the VM at `/var/intercess
 
 1.  **SSH into the VM**:
     ```bash
-    gcloud compute ssh project-intercessor --zone asia-south1-a
+    gcloud compute ssh project-intercessor --zone asia-south1-c
     ```
 
 2.  **Install SQLite3 Tool** (Run once):

@@ -3,7 +3,7 @@ substitutions:
   _REPOSITORY: "prayer-repository"
   _IMAGE_NAME: "prayer-wall-app"
   _VM_NAME: "project-intercessor"
-  _VM_ZONE: "asia-south1-a"
+  _VM_ZONE: "asia-south1-c"
 
 steps:
   # 1. Build the container image with Commit SHA tag
