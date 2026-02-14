@@ -234,7 +234,7 @@ Since the database is a standard SQLite file stored on the VM at `/var/intercess
 
 ---
 
-## Troubleshooting
+## Troubleshooting Guide
 
 -   **"Insufficient Permission"**:
     -   Check that Cloud Build SA has `roles/compute.osLogin` and `roles/artifactregistry.writer`.
