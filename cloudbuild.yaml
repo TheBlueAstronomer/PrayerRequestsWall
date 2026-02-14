@@ -40,13 +40,11 @@ steps:
         
         # Upload deploy scripts to VM (run this in cloudbuild.yaml)
         echo "Uploading deploy scripts..."
-        # Path to the script in the repo
-        SCPT="deploy-docker.sh"
         TARGET_DIR="/opt/deploy"
         # copy the script to the VM
-        gcloud compute scp --zone=${_VM_ZONE} "${SCPT}" "${_VM_NAME}:${TARGET_DIR}/${SCPT}"
+        gcloud compute scp --zone=${_VM_ZONE} "deploy-docker.sh" "${_VM_NAME}:${TARGET_DIR}/deploy-docker.sh"
         # make executable and set safe perms (owned by root, executable by all)
-        gcloud compute ssh "${_VM_NAME}" --zone=${_VM_ZONE} --command "sudo chown root:root ${TARGET_DIR}/${SCPT} && sudo chmod 755 ${TARGET_DIR}/${SCPT}"
+        gcloud compute ssh "${_VM_NAME}" --zone=${_VM_ZONE} --command "sudo chown root:root ${TARGET_DIR}/deploy-docker.sh && sudo chmod 755 ${TARGET_DIR}/deploy-docker.sh"
 
         # Execute deployment remotely
         echo "Executing remote deployment..."
