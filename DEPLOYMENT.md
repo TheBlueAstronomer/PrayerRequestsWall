@@ -15,7 +15,22 @@ Pushing to `master` will Build -> Push -> SSH (via IAM) -> Deploy.
 - **Firewall**: Allow HTTP/HTTPS.
 - **Service Account**: "Compute Engine default service account" with access to **Artifact Registry** (Storage Object Viewer).
 
-### 2. Configure the VM
+### 2. Migration to Standard Directory (Run Once)
+Run this locally to upload the hardened migration script, then SSH to run it:
+```bash
+# Upload script
+gcloud compute scp migrate-deployment.sh project-intercessor:~/ --zone asia-south1-c
+
+# Run on VM
+gcloud compute ssh project-intercessor --zone asia-south1-c --command="chmod +x migrate-deployment.sh && ./migrate-deployment.sh"
+```
+
+This script will:
+-   Verify permissions (no `chmod 777`).
+-   Move your app configuration to `/var/intercessor/app` (with backups).
+-   Create `/opt/deploy` for secure script execution.
+
+### 3. Configure the VM
 SSH into the VM and run:
 ```bash
 # Update and install Docker

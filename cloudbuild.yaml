@@ -33,15 +33,24 @@ steps:
     args:
       - '-c'
       - |
-        IMAGE_URL="${_ARTIFACT_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:$SHORT_SHA"
-        echo "Deploying $$IMAGE_URL to VM ${_VM_NAME} in ${_VM_ZONE}..."
+        IMAGE="us-central1-docker.pkg.dev/PROJECT_ID/prayer-repository/prayer-wall:$SHORT_SHA"
+        # Since we use asia-south1, we should stick to it unless you INTENDED to switch to us-central1.
+        # However, to be safe and use existing vars:
+        IMAGE="${_ARTIFACT_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:$SHORT_SHA"
+        
+        # Upload deploy scripts to VM (run this in cloudbuild.yaml)
+        echo "Uploading deploy scripts..."
+        # Path to the script in the repo
+        SCPT="deploy-docker.sh"
+        TARGET_DIR="/opt/deploy"
+        # copy the script to the VM
+        gcloud compute scp --zone=${_VM_ZONE} "${SCPT}" "${_VM_NAME}:${TARGET_DIR}/${SCPT}"
+        # make executable and set safe perms (owned by root, executable by all)
+        gcloud compute ssh "${_VM_NAME}" --zone=${_VM_ZONE} --command "sudo chown root:root ${TARGET_DIR}/${SCPT} && sudo chmod 755 ${TARGET_DIR}/${SCPT}"
 
-        gcloud compute ssh ${_VM_NAME} --zone=${_VM_ZONE} --command="
-          cd PrayerRequestsWall &&
-          export DEPLOY_IMAGE=\"$${IMAGE_URL}\" &&
-          export HOST_DATA_PATH='/var/intercessor/data' &&
-          ./deploy-docker.sh
-        "
+        # Execute deployment remotely
+        echo "Executing remote deployment..."
+        gcloud compute ssh "${_VM_NAME}" --zone="${_VM_ZONE}" --command "export DEPLOY_IMAGE='${IMAGE}' && export HOST_DATA_PATH='/var/intercessor/data' && /opt/deploy/deploy-docker.sh"
 
 images:
   - '${_ARTIFACT_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:$SHORT_SHA'

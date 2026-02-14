@@ -19,6 +19,7 @@ HEALTH_URL="http://127.0.0.1:80/api/health"
 HEALTH_RETRIES=12
 HEALTH_INTERVAL=5
 # ---------------------------------------------------
+cd /var/intercessor/app || { echo "Failed to cd to /var/intercessor/app"; exit 1; }
 
 if [ -z "${DEPLOY_IMAGE:-}" ]; then
   echo "ERROR: DEPLOY_IMAGE must be set (full image URL with tag)"
@@ -55,6 +56,9 @@ docker pull "${DEPLOY_IMAGE}"
 # 4. Update Container
 echo "Refreshing service with docker-compose..."
 # Ensure docker-compose uses the exported HOST_DATA_PATH
+# Explicitly pull the specific image tag to ensure we don't rely on 'latest' or cached
+docker pull "${DEPLOY_IMAGE}"
+# We still pull the service to ensure base images or other deps are fresh if needed, though less critical with specific tag
 docker-compose pull "${APP_SERVICE_NAME}" || true
 docker-compose up -d --no-deps --remove-orphans "${APP_SERVICE_NAME}"
 
