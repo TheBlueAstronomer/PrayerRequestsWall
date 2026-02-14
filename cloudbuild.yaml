@@ -27,28 +27,7 @@ steps:
       - 'push'
       - '${_ARTIFACT_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:latest'
 
-        # ---------------------------------------
-        # Upload latest deployment script to VM
-        # ---------------------------------------
-  - name: 'gcr.io/cloud-builders/gcloud'
-    id: 'upload-deploy-script'
-    entrypoint: 'bash'
-    args:
-      - '-c'
-      - |
-        set -euo pipefail
 
-        echo "Uploading deploy-docker.sh to VM..."
-
-        gcloud compute scp deploy-docker.sh \
-          ${_VM_NAME}:/tmp/deploy-docker.sh \
-          --zone=${_VM_ZONE}
-
-        gcloud compute ssh ${_VM_NAME} \
-          --zone=${_VM_ZONE} \
-          --command "sudo mv /tmp/deploy-docker.sh /opt/deploy/deploy-docker.sh && \
-                     sudo chown root:root /opt/deploy/deploy-docker.sh && \
-                     sudo chmod 755 /opt/deploy/deploy-docker.sh"
 
   # ---------------------------------------
   # Execute deployment

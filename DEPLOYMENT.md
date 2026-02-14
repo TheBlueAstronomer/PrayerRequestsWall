@@ -25,10 +25,15 @@ gcloud compute scp migrate-deployment.sh project-intercessor:~/ --zone asia-sout
 gcloud compute ssh project-intercessor --zone asia-south1-c --command="chmod +x migrate-deployment.sh && ./migrate-deployment.sh"
 ```
 
-This script will:
--   Verify permissions (no `chmod 777`).
--   Move your app configuration to `/var/intercessor/app` (with backups).
--   Create `/opt/deploy` for secure script execution.
+### 3. Install Deployment Script Manually (Run Once)
+Since verify Cloud Build does not have sudo access, manually install the deployment script:
+```bash
+# Upload deploy script
+gcloud compute scp deploy-docker.sh project-intercessor:/tmp/ --zone asia-south1-c
+
+# Move to secure location and set permissions
+gcloud compute ssh project-intercessor --zone asia-south1-c --command="sudo mv /tmp/deploy-docker.sh /opt/deploy/deploy-docker.sh && sudo chown root:root /opt/deploy/deploy-docker.sh && sudo chmod 755 /opt/deploy/deploy-docker.sh"
+```
 
 ### 3. Configure the VM
 SSH into the VM and run:
@@ -94,7 +99,7 @@ This is the "Magic" part. We use Google's IAM to let Cloud Build SSH into the VM
 
 5.  Add the role: **Artifact Registry Writer**.
     *   *Why?* Allows Cloud Build to push images to the registry.
-6.  Add the role: **Compute OS Login**.
+7.  Add the role: **Compute OS Login**.
     *   *Why?* Allows Cloud Build to SSH into your VM using least-privilege.
 7.  *(Optional)* Add the role: **Service Account User**.
     *   *Why?* Only needed if Cloud Build performs actions *as* the VM's service account (impersonation). Not strictly required for just SSH if OS Login is fully configured.
