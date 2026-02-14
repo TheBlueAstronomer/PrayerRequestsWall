@@ -1,0 +1,6 @@
+# Enforce LF line endings for shell scripts to prevent "bash\r" errors
+*.sh text eol=lf
+*.md text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
