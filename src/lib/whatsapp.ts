@@ -13,7 +13,8 @@ class WhatsAppService {
     constructor() {
         console.log('Initializing WhatsApp Client...');
         this.client = new Client({
-            authStrategy: new LocalAuth(),
+            authStrategy: new LocalAuth({
+                dataPath:'/app/data/.wwebjs_auth'}),
             authTimeoutMs: 60000,
             qrMaxRetries: 0,
             puppeteer: {
