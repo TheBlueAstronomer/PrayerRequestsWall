@@ -1,6 +1,6 @@
 FROM node:20-bookworm-slim
 
-# Install system dependencies for Puppeteer
+# Install system dependencies required for Puppeteer / Chromium
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     fonts-liberation \
@@ -42,20 +42,28 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Copy package files first for better caching
+# Copy dependency files first (better caching)
 COPY package.json package-lock.json ./
 
 # Install dependencies
 RUN npm ci
 
-# Copy the rest of the application
+# Copy full application
 COPY . .
 
-# Build the Next.js application
+# Build Next.js production bundle
 RUN npm run build
+
+# Create startup script
+RUN echo '#!/bin/sh\n\
+echo "Running database migrations..."\n\
+npm run db:push\n\
+echo "Starting application..."\n\
+exec npm start\n' > /app/start.sh \
+    && chmod +x /app/start.sh
 
 # Expose port
 EXPOSE 3000
 
-# Start the application using the custom server
-CMD ["npm", "start"]
+# Use startup script instead of raw npm start
+CMD ["/app/start.sh"]
