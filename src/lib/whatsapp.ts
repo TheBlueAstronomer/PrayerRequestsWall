@@ -14,7 +14,7 @@ class WhatsAppService {
         console.log('Initializing WhatsApp Client...');
         this.client = new Client({
             authStrategy: new LocalAuth({
-                dataPath:'/app/data/.wwebjs_auth'}),
+                dataPath: process.env.WA_DATA_PATH || './.wwebjs_auth'}),
             authTimeoutMs: 60000,
             qrMaxRetries: 0,
             puppeteer: {
