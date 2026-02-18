@@ -6,5 +6,5 @@ export default {
     dialect: 'sqlite',
     dbCredentials: {
     url: process.env.DB_PATH || 'sqlite.db',},
-    },
+    };
 } satisfies Config;
