@@ -56,12 +56,18 @@ jobs:
             aws ecr get-login-password --region $AWS_REGION \
               | docker login --username AWS --password-stdin $ECR_REGISTRY
 
-            echo "Pulling new image..."
-            docker pull $IMAGE
-
-            echo "Stopping old container if exists..."
+            echo "Stopping old container..."
             docker stop prayer-wall || true
             docker rm prayer-wall || true
+
+            echo "Removing old images for this repository..."
+            docker images "$ECR_REGISTRY/$ECR_REPOSITORY" -q | xargs -r docker rmi -f || true
+
+            echo "Cleaning dangling layers before pull..."
+            docker image prune -f || true
+
+            echo "Pulling new image..."
+            docker pull $IMAGE
 
             echo "Starting new container..."
             docker run -d \
@@ -73,7 +79,7 @@ jobs:
               --restart unless-stopped \
               $IMAGE
 
-            echo "Cleaning up unused images..."
-            docker image prune -af
+            echo "Final cleanup..."
+            docker image prune -f || true
 
             echo "Deployment complete"
