@@ -1,6 +1,5 @@
 import { NextResponse } from 'next/server';
-import { db } from '@/db';
-import { prayerRequests } from '@/db/schema';
+import { createPrayer } from '@/lib/prayers';
 import { whatsappService } from '@/lib/whatsapp';
 
 export async function POST(request: Request) {
@@ -17,9 +16,7 @@ export async function POST(request: Request) {
         }
 
         // Store in DB
-        await db.insert(prayerRequests).values({
-            content: message,
-        });
+        await createPrayer(message);
 
         // Send to WhatsApp
         const groupId = process.env.WHATSAPP_GROUP_ID;

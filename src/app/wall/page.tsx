@@ -1,13 +1,11 @@
-import { db } from '@/db';
-import { prayerRequests } from '@/db/schema';
-import { desc } from 'drizzle-orm';
+import { listPrayers } from '@/lib/prayers';
 import { PrayerCard } from '@/components/PrayerCard';
 import Link from 'next/link';
 
 export const dynamic = 'force-dynamic';
 
 export default async function PrayerWall() {
-    const requests = await db.select().from(prayerRequests).orderBy(desc(prayerRequests.createdAt));
+    const requests = await listPrayers();
 
     return (
         <main className="min-h-screen flex justify-center bg-black/5 dark:bg-black/20">
