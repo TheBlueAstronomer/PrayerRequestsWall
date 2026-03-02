@@ -111,7 +111,15 @@ class WhatsAppService {
 
 // Singleton pattern
 if (!global.whatsappGlobal) {
-    global.whatsappGlobal = new WhatsAppService();
+    if (process.env.VERCEL === '1') {
+        // Disable whatsapp-web.js bootstrap on Vercel/serverless runtime
+        global.whatsappGlobal = {
+            client: null as unknown as Client,
+            sendMessage: async () => false,
+        } as unknown as WhatsAppService;
+    } else {
+        global.whatsappGlobal = new WhatsAppService();
+    }
 }
 
 const whatsappService = global.whatsappGlobal;
