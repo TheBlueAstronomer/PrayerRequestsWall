@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { createPrayer } from '@/lib/prayers';
+import { createPrayer, listActiveWhatsappJids } from '@/lib/prayers';
 import { whatsappService } from '@/lib/whatsapp';
 
 export async function POST(request: Request) {
@@ -19,17 +19,20 @@ export async function POST(request: Request) {
         await createPrayer(message);
 
         // Send to WhatsApp
+        const waMessage = `🙏 *New Anonymous Prayer Request*\n\n${message}\n\nPlease keep this in prayer.`;
+
+        const targets = new Set<string>();
         const groupId = process.env.WHATSAPP_GROUP_ID;
-        if (groupId) {
-            // We don't await this necessarily to return fast response, but better to await for error handlng?
-            // PRD says "Real-time forwarding". Best effort.
-            // If we await, user waits.
-            const sent = await whatsappService.sendMessage(groupId, `🙏 *New Anonymous Request:* ${message}`);
+        if (groupId) targets.add(groupId);
+
+        const subscriberJids = await listActiveWhatsappJids();
+        for (const jid of subscriberJids) targets.add(jid);
+
+        for (const jid of targets) {
+            const sent = await whatsappService.sendMessage(jid, waMessage);
             if (!sent) {
-                console.warn('Message saved but failed to send to WhatsApp');
+                console.warn(`Message saved but failed to send WhatsApp notification to ${jid}`);
             }
-        } else {
-            console.warn('WHATSAPP_GROUP_ID not set, skipping WhatsApp message');
         }
 
         return NextResponse.json({ success: true });

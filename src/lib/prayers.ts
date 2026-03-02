@@ -7,6 +7,13 @@ type PrayerRow = {
   createdAt: Date;
 };
 
+type SubscriberRow = {
+  id: number;
+  waJid: string;
+  active: boolean;
+  createdAt: Date;
+};
+
 const DATABASE_URL = process.env.DATABASE_URL;
 const isPostgres = Boolean(DATABASE_URL);
 
@@ -23,7 +30,14 @@ function getSqlite() {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         content TEXT NOT NULL,
         created_at INTEGER NOT NULL DEFAULT (unixepoch())
-      )
+      );
+
+      CREATE TABLE IF NOT EXISTS whatsapp_subscribers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        wa_jid TEXT NOT NULL UNIQUE,
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at INTEGER NOT NULL DEFAULT (unixepoch())
+      );
     `);
   }
   return sqlite;
@@ -39,20 +53,27 @@ function getPg() {
   return pgPool;
 }
 
-async function ensurePgTable() {
+async function ensurePgTables() {
   const pool = getPg();
   await pool.query(`
     CREATE TABLE IF NOT EXISTS prayer_requests (
       id SERIAL PRIMARY KEY,
       content TEXT NOT NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
+    );
+
+    CREATE TABLE IF NOT EXISTS whatsapp_subscribers (
+      id SERIAL PRIMARY KEY,
+      wa_jid TEXT NOT NULL UNIQUE,
+      active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
   `);
 }
 
 export async function createPrayer(content: string) {
   if (isPostgres) {
-    await ensurePgTable();
+    await ensurePgTables();
     const pool = getPg();
     await pool.query('INSERT INTO prayer_requests (content) VALUES ($1)', [content]);
     return;
@@ -64,7 +85,7 @@ export async function createPrayer(content: string) {
 
 export async function listPrayers(): Promise<PrayerRow[]> {
   if (isPostgres) {
-    await ensurePgTable();
+    await ensurePgTables();
     const pool = getPg();
     const result = await pool.query(
       'SELECT id, content, created_at FROM prayer_requests ORDER BY created_at DESC LIMIT 500'
@@ -86,9 +107,59 @@ export async function listPrayers(): Promise<PrayerRow[]> {
   }));
 }
 
+export async function addWhatsappSubscriber(waJid: string) {
+  if (isPostgres) {
+    await ensurePgTables();
+    const pool = getPg();
+    await pool.query(
+      'INSERT INTO whatsapp_subscribers (wa_jid, active) VALUES ($1, TRUE) ON CONFLICT (wa_jid) DO UPDATE SET active = TRUE',
+      [waJid]
+    );
+    return;
+  }
+
+  const db = getSqlite();
+  db.prepare('INSERT INTO whatsapp_subscribers (wa_jid, active) VALUES (?, 1) ON CONFLICT(wa_jid) DO UPDATE SET active=1').run(waJid);
+}
+
+export async function listWhatsappSubscribers(): Promise<SubscriberRow[]> {
+  if (isPostgres) {
+    await ensurePgTables();
+    const pool = getPg();
+    const result = await pool.query('SELECT id, wa_jid, active, created_at FROM whatsapp_subscribers ORDER BY created_at DESC');
+    return result.rows.map((r: any) => ({
+      id: Number(r.id),
+      waJid: String(r.wa_jid),
+      active: Boolean(r.active),
+      createdAt: new Date(r.created_at),
+    }));
+  }
+
+  const db = getSqlite();
+  const rows = db.prepare('SELECT id, wa_jid, active, created_at FROM whatsapp_subscribers ORDER BY created_at DESC').all() as Array<{id:number; wa_jid:string; active:number; created_at:number}>;
+  return rows.map((r) => ({ id: r.id, waJid: r.wa_jid, active: !!r.active, createdAt: new Date(r.created_at * 1000) }));
+}
+
+export async function listActiveWhatsappJids(): Promise<string[]> {
+  const all = await listWhatsappSubscribers();
+  return all.filter((s) => s.active).map((s) => s.waJid);
+}
+
+export async function removeWhatsappSubscriber(waJid: string) {
+  if (isPostgres) {
+    await ensurePgTables();
+    const pool = getPg();
+    await pool.query('UPDATE whatsapp_subscribers SET active = FALSE WHERE wa_jid = $1', [waJid]);
+    return;
+  }
+
+  const db = getSqlite();
+  db.prepare('UPDATE whatsapp_subscribers SET active = 0 WHERE wa_jid = ?').run(waJid);
+}
+
 export async function deletePrayerById(id: number) {
   if (isPostgres) {
-    await ensurePgTable();
+    await ensurePgTables();
     const pool = getPg();
     await pool.query('DELETE FROM prayer_requests WHERE id = $1', [id]);
     return;
@@ -112,7 +183,7 @@ export async function deletePrayersOlderThanMinutes(minutes: number) {
   if (minutes <= 0) return 0;
 
   if (isPostgres) {
-    await ensurePgTable();
+    await ensurePgTables();
     const pool = getPg();
     const result = await pool.query(
       "DELETE FROM prayer_requests WHERE created_at < NOW() - ($1 || ' minutes')::interval",
