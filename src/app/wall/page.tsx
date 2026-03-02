@@ -12,7 +12,7 @@ export default async function PrayerWall() {
 
     return (
         <main className="min-h-screen flex justify-center bg-black/5 dark:bg-black/20">
-            <div className="w-full max-w-[480px] h-[100dvh] bg-background-light dark:bg-background-dark relative shadow-2xl flex flex-col border-x border-slate-200 dark:border-slate-800/50 overflow-hidden">
+            <div className="w-full max-w-[480px] h-[100dvh] bg-background-light dark:bg-background-dark relative shadow-2xl flex flex-col border-x border-slate-200 dark:border-slate-800/50 overflow-hidden hud-panel rounded-3xl my-4">
 
                 {/* Status Bar Spacer (optional, mockup has it but we can skip or simulate) */}
                 {/* <div className="h-12 w-full bg-background-light/80 dark:bg-background-dark/80 backdrop-blur-md sticky top-0 z-50 px-6 flex items-center justify-between pointer-events-none"></div> */}

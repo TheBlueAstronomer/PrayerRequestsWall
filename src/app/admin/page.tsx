@@ -32,7 +32,7 @@ export default function AdminPage() {
 
   return (
     <main className="min-h-screen flex items-center justify-center px-4 py-10 bg-black/5 dark:bg-black/20">
-      <div className="w-full max-w-xl bg-white dark:bg-slate-900/40 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 space-y-5">
+      <div className="w-full max-w-xl bg-white dark:bg-slate-900/40 border border-slate-200 dark:border-slate-800 rounded-2xl p-6 space-y-5 hud-panel shadow-2xl">
         <h1 className="text-2xl font-bold">Admin Control</h1>
         <p className="text-sm text-slate-500">Login and delete older prayer posts safely.</p>
 

@@ -39,7 +39,7 @@ export default function SubmitPage() {
     };
 
     return (
-        <main className="flex-1 flex flex-col px-6 max-w-md mx-auto w-full relative z-10">
+        <main className="flex-1 flex flex-col px-6 max-w-md mx-auto w-full relative z-10 hud-panel rounded-3xl border mt-8 mb-4 shadow-2xl">
             <div className="h-12 w-full"></div>
 
             <header className="pt-8 pb-10 text-center">

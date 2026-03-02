@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Plus_Jakarta_Sans } from "next/font/google"; // Changed from Geist to match mockups
 import "./globals.css";
+import { ThemeToggle } from "@/components/ThemeToggle";
 
 const plusJakartaSans = Plus_Jakarta_Sans({
   subsets: ["latin"],
@@ -26,6 +27,7 @@ export default function RootLayout({
         suppressHydrationWarning
         className={`${plusJakartaSans.className} antialiased bg-background-light dark:bg-background-dark text-slate-900 dark:text-slate-100`}
       >
+        <ThemeToggle />
         {children}
       </body>
     </html>
