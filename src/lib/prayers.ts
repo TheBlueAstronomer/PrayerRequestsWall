@@ -100,19 +100,24 @@ export async function deletePrayerById(id: number) {
 
 export async function deletePrayersOlderThan(days: number) {
   if (days <= 0) return 0;
+  return deletePrayersOlderThanHours(days * 24);
+}
+
+export async function deletePrayersOlderThanHours(hours: number) {
+  if (hours <= 0) return 0;
 
   if (isPostgres) {
     await ensurePgTable();
     const pool = getPg();
     const result = await pool.query(
-      "DELETE FROM prayer_requests WHERE created_at < NOW() - ($1 || ' days')::interval",
-      [days]
+      "DELETE FROM prayer_requests WHERE created_at < NOW() - ($1 || ' hours')::interval",
+      [hours]
     );
     return result.rowCount ?? 0;
   }
 
   const db = getSqlite();
-  const cutoff = Math.floor(Date.now() / 1000) - days * 86400;
+  const cutoff = Math.floor(Date.now() / 1000) - Math.floor(hours * 3600);
   const result = db.prepare('DELETE FROM prayer_requests WHERE created_at < ?').run(cutoff);
   return result.changes;
 }

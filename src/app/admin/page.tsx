@@ -6,6 +6,7 @@ export default function AdminPage() {
   const [password, setPassword] = useState('');
   const [loggedIn, setLoggedIn] = useState(false);
   const [days, setDays] = useState(30);
+  const [hours, setHours] = useState(1);
   const [postId, setPostId] = useState('');
   const [status, setStatus] = useState('');
 
@@ -52,7 +53,20 @@ export default function AdminPage() {
           <div className="space-y-4 border-t border-slate-200 dark:border-slate-800 pt-4">
             <div className="space-y-2">
               <h2 className="font-semibold">Delete old posts</h2>
-              <div className="flex gap-2">
+              <div className="flex gap-2 flex-wrap">
+                <input
+                  type="number"
+                  min={1}
+                  value={hours}
+                  onChange={(e) => setHours(Number(e.target.value || 1))}
+                  className="w-32 p-2 rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent"
+                />
+                <button onClick={() => callDelete({ olderThanHours: hours })} className="px-4 py-2 rounded-lg border border-slate-300 dark:border-slate-700 cursor-pointer">
+                  Delete older than X hours
+                </button>
+              </div>
+
+              <div className="flex gap-2 flex-wrap">
                 <input
                   type="number"
                   min={1}
