@@ -25,9 +25,14 @@ export default async function PrayerWall() {
                             <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">A safe space for your heart</p>
                         </div>
                         {/* Refresh Button - purely visual or link to self */}
-                        <a href="/wall" className="w-10 h-10 rounded-full bg-primary/10 flex items-center justify-center text-primary transition hover:bg-primary/20">
-                            <span className="material-icons-round">refresh</span>
-                        </a>
+                        <div className="flex items-center gap-2">
+                            <a href="/admin" className="px-3 h-10 rounded-full bg-slate-200/80 dark:bg-slate-800/80 flex items-center justify-center text-xs font-medium transition hover:bg-slate-300/80 dark:hover:bg-slate-700/80">
+                                Admin
+                            </a>
+                            <a href="/wall" className="w-10 h-10 rounded-full bg-primary/10 flex items-center justify-center text-primary transition hover:bg-primary/20">
+                                <span className="material-icons-round">refresh</span>
+                            </a>
+                        </div>
                     </div>
                 </header>
 

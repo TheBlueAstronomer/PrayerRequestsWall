@@ -85,3 +85,34 @@ export async function listPrayers(): Promise<PrayerRow[]> {
     createdAt: new Date(r.created_at * 1000),
   }));
 }
+
+export async function deletePrayerById(id: number) {
+  if (isPostgres) {
+    await ensurePgTable();
+    const pool = getPg();
+    await pool.query('DELETE FROM prayer_requests WHERE id = $1', [id]);
+    return;
+  }
+
+  const db = getSqlite();
+  db.prepare('DELETE FROM prayer_requests WHERE id = ?').run(id);
+}
+
+export async function deletePrayersOlderThan(days: number) {
+  if (days <= 0) return 0;
+
+  if (isPostgres) {
+    await ensurePgTable();
+    const pool = getPg();
+    const result = await pool.query(
+      "DELETE FROM prayer_requests WHERE created_at < NOW() - ($1 || ' days')::interval",
+      [days]
+    );
+    return result.rowCount ?? 0;
+  }
+
+  const db = getSqlite();
+  const cutoff = Math.floor(Date.now() / 1000) - days * 86400;
+  const result = db.prepare('DELETE FROM prayer_requests WHERE created_at < ?').run(cutoff);
+  return result.changes;
+}
