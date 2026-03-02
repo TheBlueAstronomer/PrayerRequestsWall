@@ -1,11 +1,14 @@
 import { listPrayers } from '@/lib/prayers';
-import { PrayerCard } from '@/components/PrayerCard';
+import { PrayerWallFolders } from '@/components/PrayerWallFolders';
 import Link from 'next/link';
 
 export const dynamic = 'force-dynamic';
 
 export default async function PrayerWall() {
-    const requests = await listPrayers();
+    const requests = (await listPrayers()).map((req) => ({
+        ...req,
+        createdAt: req.createdAt.toISOString(),
+    }));
 
     return (
         <main className="min-h-screen flex justify-center bg-black/5 dark:bg-black/20">
@@ -30,13 +33,7 @@ export default async function PrayerWall() {
 
                 {/* Scrollable Content */}
                 <div className="flex-1 overflow-y-auto px-6 py-6 space-y-4 scroll-smooth">
-                    {requests.map((req, i) => (
-                        <PrayerCard
-                            key={req.id}
-                            request={{ ...req, createdAt: req.createdAt.toISOString() }}
-                            index={i}
-                        />
-                    ))}
+                    {requests.length > 0 && <PrayerWallFolders requests={requests} />}
                     {requests.length === 0 && (
                         <div className="text-center text-slate-400 py-10">
                             No requests yet. Be the first to share.
