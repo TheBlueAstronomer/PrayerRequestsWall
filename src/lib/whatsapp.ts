@@ -1,6 +1,9 @@
 import { Client, LocalAuth } from 'whatsapp-web.js';
 import qrcode from 'qrcode-terminal';
 
+import { appSettings } from '@/db/schema';
+import { db } from '@/db';
+
 // Define the shape of our global object to include our service
 declare global {
     var whatsappGlobal: WhatsAppService | undefined;
@@ -9,6 +12,7 @@ declare global {
 class WhatsAppService {
     public client: Client;
     private isReady: boolean = false;
+    public latestQR: string | null = null;
 
     constructor() {
         console.log('Initializing WhatsApp Client...');
@@ -34,16 +38,19 @@ class WhatsAppService {
 
         this.client.on('qr', (qr) => {
             console.log('QR RECEIVED', qr);
+            this.latestQR = qr;
             qrcode.generate(qr, { small: true });
         });
 
         this.client.on('ready', () => {
             console.log('WhatsApp Client is ready!');
             this.isReady = true;
+            this.latestQR = null;
         });
 
         this.client.on('authenticated', () => {
             console.log('AUTHENTICATED');
+            this.latestQR = null;
         });
 
         this.client.on('auth_failure', msg => {

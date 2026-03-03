@@ -8,3 +8,8 @@ export const prayerRequests = sqliteTable('prayer_requests', {
     .notNull()
     .default(sql`(unixepoch())`), // Store as timestamp
 });
+
+export const appSettings = sqliteTable('app_settings', {
+  key: text('key').primaryKey(),
+  value: text('value').notNull(),
+});
