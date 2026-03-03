@@ -13,11 +13,15 @@ class WhatsAppService {
     public client: Client;
     private isReady: boolean = false;
     public latestQR: string | null = null;
+    private isShuttingDown: boolean = false;
 
     constructor() {
         console.log('Initializing WhatsApp Client...');
+
         this.client = new Client({
-            authStrategy: new LocalAuth(),
+            authStrategy: new LocalAuth({
+                dataPath: process.env.WA_DATA_PATH || './.wwebjs_auth',
+            }),
             authTimeoutMs: 60000,
             qrMaxRetries: 0,
             puppeteer: {
@@ -31,7 +35,6 @@ class WhatsAppService {
                     '--no-zygote',
                     '--disable-gpu'
                 ],
-                // Increase timeout for slow environments checks
                 protocolTimeout: 120000,
             },
         });
@@ -53,14 +56,41 @@ class WhatsAppService {
             this.latestQR = null;
         });
 
-        this.client.on('auth_failure', msg => {
+        this.client.on('auth_failure', (msg) => {
             console.error('AUTHENTICATION FAILURE', msg);
         });
 
-        // Initialize with error handling
+        this.client.on('disconnected', (reason) => {
+            console.warn('WhatsApp disconnected:', reason);
+            this.isReady = false;
+        });
+
+        this.setupGracefulShutdown();
+
         this.client.initialize().catch(err => {
             console.error('Failed to initialize WhatsApp client:', err);
         });
+    }
+
+    private setupGracefulShutdown() {
+        const shutdown = async (signal: string) => {
+            if (this.isShuttingDown) return;
+            this.isShuttingDown = true;
+
+            console.log(`${signal} received. Shutting down WhatsApp client gracefully...`);
+
+            try {
+                await this.client.destroy();
+                console.log('WhatsApp client destroyed successfully.');
+            } catch (err) {
+                console.error('Error while destroying WhatsApp client:', err);
+            }
+
+            process.exit(0);
+        };
+
+        process.on('SIGTERM', () => shutdown('SIGTERM'));
+        process.on('SIGINT', () => shutdown('SIGINT'));
     }
 
     public async sendMessage(chatId: string, message: string): Promise<boolean> {
@@ -68,6 +98,7 @@ class WhatsAppService {
             console.warn('WhatsApp client not ready yet.');
             return false;
         }
+
         try {
             console.log(`Attempting to send message to chatId: ${chatId}`);
             await this.client.sendMessage(chatId, message);
@@ -75,7 +106,6 @@ class WhatsAppService {
             return true;
         } catch (error) {
             console.error('Failed to send message:', error);
-            // detailed inspection
             try {
                 console.error('Error details:', JSON.stringify(error, Object.getOwnPropertyNames(error)));
             } catch (e) {
@@ -86,9 +116,7 @@ class WhatsAppService {
     }
 }
 
-// Singleton pattern to prevent multiple instances
-// We attach to global to survive Next.js HMR and to prevent double-init in production
-// when both server.ts and Next.js bundle import this module.
+// Singleton pattern
 if (!global.whatsappGlobal) {
     global.whatsappGlobal = new WhatsAppService();
 }
