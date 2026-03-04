@@ -4,6 +4,28 @@ Project Intercessor is a digital safe haven for youth group members to share pra
 1.  **Instant Broadcast:** Forwards prayer requests instantly to a designated WhatsApp group via a bot.
 2.  **Public Prayer Wall:** Maintains a persistent, public "Prayer Wall" for members to view and pray for past requests.
 
+## Live Production App
+
+- **Vercel:** https://prayer-requests-wall.vercel.app
+
+## Feature Set Included in This Branch
+
+- Anonymous prayer submission flow
+- Public prayer wall listing with date-based folder grouping (Year/Month/Day)
+- Admin panel with password protection
+- Admin cleanup controls:
+  - delete by post id
+  - delete posts older than minutes/hours/days
+- Futuristic dashboard-inspired UI polish with dark/light theme toggle
+- Persistent database-ready data layer (Postgres + SQLite fallback)
+- Notification plumbing for WhatsApp subscriber fanout
+
+## Potential Feature Roadmap
+
+- [ ] WhatsApp / Signal notifications
+- [ ] Daily cron job to check prayer wall status
+- [ ] Auto-purge / archive entries older than 90 days
+
 ## Features
 
 -   **100% Anonymity:** No IP logging, user tracking, or login required.
