@@ -16,6 +16,7 @@ export default function AdminPage() {
     const [authError, setAuthError] = useState("");
 
     const [groupSetting, setGroupSetting] = useState("");
+    const [savedGroupSetting, setSavedGroupSetting] = useState("");
     const [settingsMsg, setSettingsMsg] = useState("");
 
     const [prayers, setPrayers] = useState<Prayer[]>([]);
@@ -58,6 +59,7 @@ export default function AdminPage() {
             const data = await res.json();
             if (data.success) {
                 setGroupSetting(data.whatsapp_group_ids || "");
+                setSavedGroupSetting(data.whatsapp_group_ids || "");
             }
         } catch (error) {
             console.error("Failed to fetch settings", error);
@@ -74,6 +76,7 @@ export default function AdminPage() {
             });
             if (res.ok) {
                 setSettingsMsg("Settings saved!");
+                setSavedGroupSetting(groupSetting);
                 setTimeout(() => setSettingsMsg(""), 3000);
             } else {
                 setSettingsMsg("Failed to save.");
@@ -83,12 +86,11 @@ export default function AdminPage() {
         }
     };
 
-    const groupIds = groupSetting.split(',').map(id => id.trim()).filter(id => id.length > 0);
+    const groupIds = savedGroupSetting.split(',').map(id => id.trim()).filter(id => id.length > 0);
 
     const removeGroupId = async (idToRemove: string) => {
         const newGroups = groupIds.filter(id => id !== idToRemove);
         const newSetting = newGroups.join(',');
-        setGroupSetting(newSetting);
 
         setSettingsMsg("Removing ID...");
         try {
@@ -98,6 +100,8 @@ export default function AdminPage() {
                 body: JSON.stringify({ whatsapp_group_ids: newSetting }),
             });
             if (res.ok) {
+                setGroupSetting(newSetting);
+                setSavedGroupSetting(newSetting);
                 setSettingsMsg("ID removed!");
                 setTimeout(() => setSettingsMsg(""), 3000);
             } else {
