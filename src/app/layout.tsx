@@ -26,6 +26,7 @@ export default function RootLayout({
       </head>
       <body
         className={`${plusJakartaSans.className} antialiased bg-background-light dark:bg-background-dark text-slate-900 dark:text-slate-100 transition-colors duration-300`}
+        suppressHydrationWarning
       >
         <ThemeProvider>
           <ThemeToggle />

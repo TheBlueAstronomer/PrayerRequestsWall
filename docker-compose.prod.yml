@@ -1,0 +1,17 @@
+version: "3.8"
+
+services:
+  app:
+    image: asia-south1-docker.pkg.dev/${PROJECT_ID}/prayer-repository/prayer-wall-app:latest
+    container_name: prayer-wall-app-prod
+    restart: always
+    ports:
+      - "80:3000"
+    volumes:
+      - /var/intercessor/data/.wwebjs_auth:/app/.wwebjs_auth
+      - /var/intercessor/data/.wwebjs_cache:/app/.wwebjs_cache
+      - /var/intercessor/data/sqlite.db:/app/sqlite.db
+    environment:
+      - NODE_ENV=production
+    env_file:
+      - /var/intercessor/app/.env

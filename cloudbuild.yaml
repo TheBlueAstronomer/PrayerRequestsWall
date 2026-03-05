@@ -6,54 +6,54 @@ substitutions:
   _VM_ZONE: "asia-south1-c"
 
 steps:
-  # 1. Build the container image with Commit SHA tag
+  # Pull the cached image from Artifact Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    entrypoint: 'bash'
+    args: ['-c', 'docker pull ${_ARTIFACT_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:latest || exit 0']
+
+  # 1. Build the App Docker image
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - 'build'
+      - '--cache-from'
+      - '${_ARTIFACT_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:latest'
       - '-t'
-      - '${_ARTIFACT_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:$SHORT_SHA'
+      - '${_ARTIFACT_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:$COMMIT_SHA'
       - '-t'
       - '${_ARTIFACT_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:latest'
       - '.'
+    id: 'build-app'
 
-  # 2. Push the container image (both tags)
+  # 2. Push the App Docker image to Artifact Registry
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - 'push'
-      - '${_ARTIFACT_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:$SHORT_SHA'
+      - '--all-tags'
+      - '${_ARTIFACT_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}'
+    id: 'push-app'
 
-  - name: 'gcr.io/cloud-builders/docker'
-    args:
-      - 'push'
-      - '${_ARTIFACT_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:latest'
-
-
-
-  # ---------------------------------------
-  # Execute deployment
-  # ---------------------------------------
-  - name: 'gcr.io/cloud-builders/gcloud'
-    id: 'run-deploy'
+  # 3. Deploy App to Compute Engine (VM)
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     entrypoint: 'bash'
     args:
       - '-c'
       - |
-        set -euo pipefail
+        # Securely copy the Compose file to the VM's /tmp directory
+        gcloud compute scp docker-compose.prod.yml ${_VM_NAME}:/tmp/docker-compose.prod.yml --zone=${_VM_ZONE} --quiet
+        
+        # SSH in to move the files, pull the new images, and restart the containers
+        gcloud compute ssh ${_VM_NAME} --zone=${_VM_ZONE} --quiet --command="sudo bash -c '\
+          mkdir -p /var/intercessor/app && \
+          cp /tmp/docker-compose.prod.yml /var/intercessor/app/ && \
+          cd /var/intercessor/app && \
+          gcloud auth configure-docker ${_ARTIFACT_REGION}-docker.pkg.dev --quiet && \
+          export PROJECT_ID=$PROJECT_ID && \
+          docker-compose -f docker-compose.prod.yml pull && \
+          docker-compose -f docker-compose.prod.yml up -d'"
+    id: 'deploy-vm'
 
-        # Define the image path (using built-in project ID variable)
-        IMAGE="${_ARTIFACT_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:$SHORT_SHA"
-
-        echo "Deploying image: $$IMAGE"
-
-        # Execute the deployment script on the VM
-        # Note: We escape $$IMAGE so the shell sees the variable value, not Cloud Build substitution
-        gcloud compute ssh ${_VM_NAME} \
-          --zone=${_VM_ZONE} \
-          --command "export DEPLOY_IMAGE='$$IMAGE' && \
-                     export HOST_DATA_PATH='/var/intercessor/data' && \
-                     /opt/deploy/deploy-docker.sh"
 images:
-  - '${_ARTIFACT_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:$SHORT_SHA'
+  - '${_ARTIFACT_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:$COMMIT_SHA'
   - '${_ARTIFACT_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:latest'
 
 options:
