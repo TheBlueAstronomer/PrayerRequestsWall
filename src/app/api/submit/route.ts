@@ -29,7 +29,7 @@ export async function POST(request: Request) {
         if (groupIdsStr) {
             const groupIds = groupIdsStr.split(',').map(id => id.trim()).filter(id => id.length > 0);
             for (const targetId of groupIds) {
-                const sent = await whatsappService.sendMessage(targetId, `🙏 *New Anonymous Request:* ${message}`);
+                const sent = await whatsappService?.sendMessage(targetId, `🙏 *New Anonymous Request:* ${message}`);
                 if (!sent) {
                     console.warn(`Message saved but failed to send to WhatsApp target: ${targetId}`);
                 }
