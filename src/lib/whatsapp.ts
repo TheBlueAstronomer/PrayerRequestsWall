@@ -117,7 +117,8 @@ class WhatsAppService {
 }
 
 // Singleton pattern
-if (!global.whatsappGlobal) {
+const isBuild = process.env.npm_lifecycle_event === 'build' || process.argv.includes('build');
+if (!global.whatsappGlobal && !isBuild) {
     global.whatsappGlobal = new WhatsAppService();
 }
 

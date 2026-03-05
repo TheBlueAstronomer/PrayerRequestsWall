@@ -5,10 +5,12 @@ services:
     image: asia-south1-docker.pkg.dev/${PROJECT_ID}/prayer-repository/prayer-wall-app:latest
     container_name: prayer-wall-app-prod
     restart: always
+    shm_size: '1gb'
     ports:
       - "80:3000"
     volumes:
       - /var/intercessor/data/sqlite.db:/app/sqlite.db
+      - /var/intercessor/data/wwebjs_auth:/app/.wwebjs_auth
     environment:
       - NODE_ENV=production
     env_file:
