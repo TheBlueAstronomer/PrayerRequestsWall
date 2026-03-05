@@ -83,6 +83,31 @@ export default function AdminPage() {
         }
     };
 
+    const groupIds = groupSetting.split(',').map(id => id.trim()).filter(id => id.length > 0);
+
+    const removeGroupId = async (idToRemove: string) => {
+        const newGroups = groupIds.filter(id => id !== idToRemove);
+        const newSetting = newGroups.join(',');
+        setGroupSetting(newSetting);
+
+        setSettingsMsg("Removing ID...");
+        try {
+            const res = await fetch("/api/admin/settings", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ whatsapp_group_ids: newSetting }),
+            });
+            if (res.ok) {
+                setSettingsMsg("ID removed!");
+                setTimeout(() => setSettingsMsg(""), 3000);
+            } else {
+                setSettingsMsg("Failed to remove ID.");
+            }
+        } catch (error) {
+            setSettingsMsg("Error removing ID.");
+        }
+    };
+
     const fetchPrayers = async () => {
         try {
             const res = await fetch("/api/admin/prayers");
@@ -179,6 +204,26 @@ export default function AdminPage() {
                         </button>
                         {settingsMsg && <p className="text-sm text-green-600 dark:text-green-400 mt-2">{settingsMsg}</p>}
                     </div>
+
+                    {groupIds.length > 0 && (
+                        <div className="mt-6 pt-4 border-t border-slate-200 dark:border-slate-800">
+                            <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-300 mb-3">Configured IDs:</h3>
+                            <ul className="flex flex-col gap-2">
+                                {groupIds.map(id => (
+                                    <li key={id} className="flex items-center justify-between p-3 rounded-md bg-slate-50 dark:bg-slate-800 border border-slate-100 dark:border-slate-700">
+                                        <span className="font-mono text-sm text-slate-600 dark:text-slate-400 break-all">{id}</span>
+                                        <button
+                                            onClick={() => removeGroupId(id)}
+                                            className="ml-4 p-1.5 text-slate-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-md transition-colors flex-shrink-0"
+                                            title="Remove ID"
+                                        >
+                                            <span className="material-icons-round text-sm">delete</span>
+                                        </button>
+                                    </li>
+                                ))}
+                            </ul>
+                        </div>
+                    )}
                 </section>
 
                 {/* QR Code Section */}

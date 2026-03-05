@@ -8,8 +8,6 @@ services:
     ports:
       - "80:3000"
     volumes:
-      - /var/intercessor/data/.wwebjs_auth:/app/.wwebjs_auth
-      - /var/intercessor/data/.wwebjs_cache:/app/.wwebjs_cache
       - /var/intercessor/data/sqlite.db:/app/sqlite.db
     environment:
       - NODE_ENV=production
