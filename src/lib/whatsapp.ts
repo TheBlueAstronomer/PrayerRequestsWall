@@ -114,6 +114,29 @@ class WhatsAppService {
             return false;
         }
     }
+
+    public async logout(): Promise<boolean> {
+        console.log('Attempting to logout WhatsApp client...');
+        try {
+            await this.client.logout();
+            console.log('WhatsApp client logged out successfully.');
+
+            // Reset state
+            this.isReady = false;
+            this.latestQR = null;
+
+            // Re-initialize to get a new QR code
+            console.log('Re-initializing WhatsApp client for new session...');
+            this.client.initialize().catch(err => {
+                console.error('Failed to re-initialize WhatsApp client:', err);
+            });
+
+            return true;
+        } catch (error) {
+            console.error('Failed to logout WhatsApp client:', error);
+            return false;
+        }
+    }
 }
 
 // Singleton pattern

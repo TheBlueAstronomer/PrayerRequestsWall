@@ -21,6 +21,7 @@ export default function AdminPage() {
 
     const [prayers, setPrayers] = useState<Prayer[]>([]);
     const [qrCodeData, setQrCodeData] = useState<string | null>(null);
+    const [isLoggingOut, setIsLoggingOut] = useState(false);
 
     // Initial load logic if authenticated
     useEffect(() => {
@@ -148,6 +149,26 @@ export default function AdminPage() {
         }
     };
 
+    const handleLogout = async () => {
+        if (!confirm("Are you sure you want to logout the WhatsApp bot? This will disconnect the current session.")) return;
+
+        setIsLoggingOut(true);
+        try {
+            const res = await fetch("/api/admin/logout", { method: "POST" });
+            const data = await res.json();
+            if (!data.success) {
+                alert("Failed to logout: " + (data.error || "Unknown error"));
+            }
+        } catch (error) {
+            console.error("Failed to logout", error);
+            alert("Failed to logout. Check console for details.");
+        } finally {
+            setIsLoggingOut(false);
+            // We don't need to manually clear state here because 
+            // the fetchQrCode interval will pick up the new QR code.
+        }
+    };
+
     if (!isAuthenticated) {
         return (
             <main className="flex-1 flex flex-col items-center justify-center px-4 w-full">
@@ -243,10 +264,21 @@ export default function AdminPage() {
                                 <p className="text-sm text-slate-500 text-center">Scan to connect WhatsApp Bot</p>
                             </div>
                         ) : (
-                            <div className="text-center text-slate-500 flex flex-col items-center gap-2">
-                                <span className="material-icons-round text-4xl opacity-50">check_circle</span>
-                                <p>WhatsApp is connected or initializing.</p>
-                                <p className="text-xs">No QR code requested.</p>
+                            <div className="text-center text-slate-500 flex flex-col items-center gap-4">
+                                <div className="flex flex-col items-center gap-2">
+                                    <span className="material-icons-round text-4xl opacity-50 text-green-500">check_circle</span>
+                                    <p className="font-medium text-slate-700 dark:text-slate-300">WhatsApp is connected.</p>
+                                    <p className="text-xs">No QR code requested.</p>
+                                </div>
+
+                                <button
+                                    onClick={handleLogout}
+                                    disabled={isLoggingOut}
+                                    className="mt-4 px-4 py-2 bg-red-50 hover:bg-red-100 text-red-600 dark:bg-red-900/20 dark:hover:bg-red-900/40 dark:text-red-400 rounded-lg text-sm font-medium transition-colors border border-red-200 dark:border-red-800 flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                                >
+                                    <span className="material-icons-round text-sm">logout</span>
+                                    {isLoggingOut ? "Logging out..." : "Logout WhatsApp Session"}
+                                </button>
                             </div>
                         )}
                     </div>
