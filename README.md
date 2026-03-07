@@ -1,27 +1,29 @@
 # Prayer Requests Wall (Project Intercessor)
 
-Project Intercessor is a digital safe haven for youth group members to share prayer requests anonymously. It serves two main functions:
-1.  **Instant Broadcast:** Forwards prayer requests instantly to a designated WhatsApp group via a bot.
+Project Intercessor is a digital safe haven for youth group members to share prayer requests anonymously. It serves three main functions:
+1.  **Instant Broadcast:** Forwards prayer requests instantly to designated WhatsApp groups via a bot.
 2.  **Public Prayer Wall:** Maintains a persistent, public "Prayer Wall" for members to view and pray for past requests.
+3.  **Admin Management:** A secure dashboard to manage the WhatsApp bot, configure group IDs, and moderate prayer requests.
 
 ## Features
 
--   **100% Anonymity:** No IP logging, user tracking, or login required.
--   **Real-time WhatsApp Integration:** Automatically posts new requests to a WhatsApp group.
--   **Public Prayer Wall:** A read-only feed of all submitted requests.
+-   **100% Anonymity:** No IP logging, user tracking, or login required for members.
+-   **Real-time WhatsApp Integration:** Automatically posts new requests to one or more WhatsApp groups.
+-   **Admin Dashboard:** 
+    -   Secure login with password protection.
+    -   Live WhatsApp QR code for easy bot authentication.
+    -   Dynamic configuration of target WhatsApp Group/Chat IDs.
+    -   Prayer request moderation (view and delete entries).
+-   **Public Prayer Wall:** A beautiful, read-only feed of all submitted requests.
 -   **Modern UI:** "Sanctuary" theme with glassmorphism effects and smooth animations using Framer Motion.
--   **Lightweight:** Built to run on minimal infrastructure (AWS Free Tier).
-
-## Use Cases
-
--   **The Member:** Can submit a prayer request without social anxiety and see it acknowledged immediately.
--   **The Leader/Community:** Receives requests instantly in their WhatsApp group to respond with prayer.
+-   **Automated Deployment:** Integrated CI/CD pipeline for Google Cloud Platform.
 
 ## Tech Stack
 
--   **Framework:** [Next.js](https://nextjs.org/) (App Router)
+-   **Framework:** [Next.js 15](https://nextjs.org/) (App Router)
 -   **Language:** [TypeScript](https://www.typescriptlang.org/)
--   **Styling:** [Tailwind CSS](https://tailwindcss.com/)
+-   **Library:** [React 19](https://react.dev/)
+-   **Styling:** [Tailwind CSS 4](https://tailwindcss.com/)
 -   **Animations:** [Framer Motion](https://www.framer.com/motion/)
 -   **Database:** [SQLite](https://www.sqlite.org/) with [Drizzle ORM](https://orm.drizzle.team/)
 -   **WhatsApp:** [whatsapp-web.js](https://wwebjs.dev/)
@@ -41,87 +43,67 @@ Project Intercessor is a digital safe haven for youth group members to share pra
     cd PrayerRequestsWall
     ```
 
-2.  Create your `.env` file:
+2.  Create your `.env` file from the provided environment variables:
     ```bash
-    cp .env.example .env
-    # Edit .env with your credentials
+    # Create and edit .env with your credentials
+    # Required: ADMIN_PASSWORD, etc.
     ```
 
-3.  Create local data directory (Required for Docker):
+3.  Create local data directory (Required for Docker persistence):
     ```bash
     mkdir data
     ```
 
 ### Running Locally (Docker - Recommended)
-The project is containerized, which is the easiest way to run it and matches the production environment.
+
+The project is containerized, matching the production environment.
 
 1.  Start the application:
     ```bash
     docker-compose up
     ```
 2.  Open [http://localhost](http://localhost).
-3.  **WhatsApp Auth**: Watch the terminal logs. A QR code will appear. Scan it with your WhatsApp mobile app to link the bot.
+3.  **Admin & WhatsApp Auth**: 
+    -   Go to [http://localhost/admin](http://localhost/admin).
+    -   Log in with your `ADMIN_PASSWORD`.
+    -   Scan the QR code displayed on the dashboard with your WhatsApp mobile app.
 
-### Running Locally (Manual / Legacy)
-If you prefer running without Docker:
-
-1.  Install dependencies:
-    ```bash
-    npm install
-    ```
-
-2.  Set up the database:
-    ```bash
-    npm run db:push
-    ```
-
-3.  Run the server:
-    ```bash
-    npm run dev:custom
-    ```
-    (See "Full Application" below for details).
-
-This project supports two modes of operation:
+### Running Locally (Development Mode)
 
 #### 1. Standard Development (Frontend Only)
-Run the standard Next.js development server if you only need to work on the UI pages (Submission Form, Prayer Wall). Note that WhatsApp functionality *will not work* in this mode.
-
+Use this if you only need to work on the UI. WhatsApp functionality will be disabled.
 ```bash
 npm run dev
 ```
-Open [http://localhost:3000](http://localhost:3000) in your browser.
+Open [http://localhost:3000](http://localhost:3000).
 
 #### 2. Full Application (with WhatsApp Bot)
-To run the full application including the custom server for WhatsApp integration:
-
+To run the full application including the custom server:
 ```bash
 npm run dev:custom
 ```
+Watch the terminal for the QR code or use the Admin Dashboard at `/admin`.
 
-**First Run Instructions:**
--   When you run `npm run dev:custom` for the first time, a QR code will be generated in your terminal.
--   Scan this QR code with the WhatsApp account you want to use as the "Bot".
--   Once authenticated, the session will be saved locally in `.wwebjs_auth`.
+## Scripts
 
-## scripts
-
--   `npm run dev`: Starts the Next.js dev server (no custom server).
--   `npm run dev:custom`: Starts the custom server with `nodemon` (Next.js + WhatsApp).
--   `npm run build`: Builds the Next.js application for production.
--   `npm run start`: Starts the production Next.js server.
--   `npm run lint`: Runs ESLint.
+-   `npm run dev`: Starts the Next.js dev server (no WhatsApp bot).
+-   `npm run dev:custom`: Starts the custom server (Next.js + WhatsApp bot) using `tsx`.
+-   `npm run build`: Builds the application for production.
+-   `npm run start`: Starts the production server (custom server mode).
 -   `npm run db:push`: Pushes schema changes to the SQLite database.
--   `npm run db:studio`: Opens Drizzle Studio to view/edit database content.
+-   `npm run db:studio`: Opens Drizzle Studio to manage database content.
 
 ## Project Structure
 
--   `/src/app`: Next.js App Router pages and layouts.
--   `/src/components`: Reusable UI components.
--   `/src/lib`: Utility functions (including WhatsApp client logic).
--   `/server.ts`: Custom Node.js server entry point for coordinating Next.js and whatsapp-web.js.
--   `drizzle.config.ts`: Configuration for Drizzle ORM.
--   `PRD.md`: Detailed Product Requirements Document.
+-   `/src/app`: Next.js App Router (Home, Wall, Admin Dashboard).
+-   `/src/app/api`: Backend API routes for submission, admin auth, and settings.
+-   `/src/components`: Premium UI components with Framer Motion animations.
+-   `/src/lib`: Core logic (WhatsApp service, database client).
+-   `/server.ts`: Custom Node.js entry point coordinating Next.js and the WhatsApp bot.
+-   `cloudbuild.yaml`: Automated build and deploy configuration for GCP.
 
 ## Deployment
 
-See **[DEPLOYMENT.md](DEPLOYMENT.md)** for a complete guide on deploying this application to Google Cloud Platform (GCP) using Cloud Build, Artifact Registry, and Compute Engine.
+This project uses a **fully automated CI/CD pipeline** targeting Google Cloud Platform (Compute Engine + Artifact Registry). 
+
+See **[DEPLOYMENT.md](DEPLOYMENT.md)** for detailed instructions on setting up the infrastructure and the automated workflow.

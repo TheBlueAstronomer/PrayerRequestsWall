@@ -120,8 +120,17 @@ class WhatsAppService {
         try {
             await this.client.logout();
             console.log('WhatsApp client logged out successfully.');
-
-            // Reset state
+        } catch (error) {
+            console.error('Failed to logout WhatsApp client gracefully:', error);
+            console.log('Attempting to forcefully destroy WhatsApp client...');
+            try {
+                await this.client.destroy();
+                console.log('WhatsApp client destroyed forcefully.');
+            } catch (destroyError) {
+                console.error('Failed to destroy WhatsApp client:', destroyError);
+            }
+        } finally {
+            // Reset state regardless of success or failure
             this.isReady = false;
             this.latestQR = null;
 
@@ -130,12 +139,8 @@ class WhatsAppService {
             this.client.initialize().catch(err => {
                 console.error('Failed to re-initialize WhatsApp client:', err);
             });
-
-            return true;
-        } catch (error) {
-            console.error('Failed to logout WhatsApp client:', error);
-            return false;
         }
+        return true;
     }
 }
 
