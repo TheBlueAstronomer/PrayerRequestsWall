@@ -14,9 +14,10 @@ class WhatsAppService {
     private isReady: boolean = false;
     public latestQR: string | null = null;
     private isShuttingDown: boolean = false;
+    private isInitializing: boolean = false;
 
     constructor() {
-        console.log('Initializing WhatsApp Client...');
+        console.log('Constructing WhatsAppService instance...');
 
         this.client = new Client({
             authStrategy: new LocalAuth({
@@ -40,15 +41,16 @@ class WhatsAppService {
         });
 
         this.client.on('qr', (qr) => {
-            console.log('QR RECEIVED', qr);
+            console.log('QR RECEIVED (length):', qr.length);
             this.latestQR = qr;
-            qrcode.generate(qr, { small: true });
+            // qrcode.generate(qr, { small: true });
         });
 
         this.client.on('ready', () => {
             console.log('WhatsApp Client is ready!');
             this.isReady = true;
             this.latestQR = null;
+            this.isInitializing = false;
         });
 
         this.client.on('authenticated', () => {
@@ -58,18 +60,34 @@ class WhatsAppService {
 
         this.client.on('auth_failure', (msg) => {
             console.error('AUTHENTICATION FAILURE', msg);
+            this.isInitializing = false;
         });
 
         this.client.on('disconnected', (reason) => {
             console.warn('WhatsApp disconnected:', reason);
             this.isReady = false;
+            this.isInitializing = false;
         });
 
         this.setupGracefulShutdown();
+        this.initialize();
+    }
 
-        this.client.initialize().catch(err => {
+    public async initialize() {
+        if (this.isInitializing || this.isReady) {
+            console.log('WhatsApp client already initializing or ready. Skipping redundant initialize.');
+            return;
+        }
+
+        this.isInitializing = true;
+        console.log('Initializing WhatsApp client...');
+
+        try {
+            await this.client.initialize();
+        } catch (err) {
+            this.isInitializing = false;
             console.error('Failed to initialize WhatsApp client:', err);
-        });
+        }
     }
 
     private setupGracefulShutdown() {
@@ -89,13 +107,20 @@ class WhatsAppService {
             process.exit(0);
         };
 
-        process.on('SIGTERM', () => shutdown('SIGTERM'));
-        process.on('SIGINT', () => shutdown('SIGINT'));
+        if (typeof process !== 'undefined') {
+            process.on('SIGTERM', () => shutdown('SIGTERM'));
+            process.on('SIGINT', () => shutdown('SIGINT'));
+        }
     }
 
     public async sendMessage(chatId: string, message: string): Promise<boolean> {
+        console.log(`Checking if ready to send... isReady: ${this.isReady}, isInitializing: ${this.isInitializing}`);
         if (!this.isReady) {
             console.warn('WhatsApp client not ready yet.');
+            if (!this.isInitializing) {
+                console.log('Attempting to re-initialize...');
+                this.initialize();
+            }
             return false;
         }
 
@@ -106,11 +131,6 @@ class WhatsAppService {
             return true;
         } catch (error) {
             console.error('Failed to send message:', error);
-            try {
-                console.error('Error details:', JSON.stringify(error, Object.getOwnPropertyNames(error)));
-            } catch (e) {
-                console.error('Could not stringify error:', e);
-            }
             return false;
         }
     }
@@ -130,26 +150,24 @@ class WhatsAppService {
                 console.error('Failed to destroy WhatsApp client:', destroyError);
             }
         } finally {
-            // Reset state regardless of success or failure
             this.isReady = false;
             this.latestQR = null;
-
-            // Re-initialize to get a new QR code
+            this.isInitializing = false;
             console.log('Re-initializing WhatsApp client for new session...');
-            this.client.initialize().catch(err => {
-                console.error('Failed to re-initialize WhatsApp client:', err);
-            });
+            this.initialize();
         }
         return true;
     }
 }
 
-// Singleton pattern
+// Singleton pattern for Next.js
 const isBuild = process.env.npm_lifecycle_event === 'build' || process.argv.includes('build');
-if (!global.whatsappGlobal && !isBuild) {
-    global.whatsappGlobal = new WhatsAppService();
+const globalForWhatsApp = globalThis as unknown as { whatsappGlobal: WhatsAppService | undefined };
+
+if (!globalForWhatsApp.whatsappGlobal && !isBuild) {
+    globalForWhatsApp.whatsappGlobal = new WhatsAppService();
 }
 
-const whatsappService = global.whatsappGlobal;
+const whatsappService = globalForWhatsApp.whatsappGlobal!;
 
 export { whatsappService };
