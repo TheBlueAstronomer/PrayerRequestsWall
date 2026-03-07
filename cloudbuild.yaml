@@ -39,10 +39,10 @@ steps:
       - '-c'
       - |
         # Securely copy the Compose file to the VM's /tmp directory
-        gcloud compute scp docker-compose.prod.yml ${_VM_NAME}:/tmp/docker-compose.prod.yml --zone=${_VM_ZONE} --quiet
+        gcloud compute scp docker-compose.prod.yml deploy-user@${_VM_NAME}:/tmp/docker-compose.prod.yml --zone=${_VM_ZONE} --quiet
         
         # SSH in to move the files, pull the new images, and restart the containers
-        gcloud compute ssh ${_VM_NAME} --zone=${_VM_ZONE} --quiet --command="sudo bash -c '\
+        gcloud compute ssh deploy-user@${_VM_NAME} --zone=${_VM_ZONE} --quiet --command="sudo bash -c '\
           mkdir -p /var/intercessor/app && \
           cp /tmp/docker-compose.prod.yml /var/intercessor/app/ && \
           cd /var/intercessor/app && \
