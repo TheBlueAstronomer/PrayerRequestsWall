@@ -19,7 +19,7 @@ services:
       driver: gcplogs
       options:
         gcp-log-cmd: "true"
-        labels: "com.docker.compose.service"
+        tag: "prayer-wall-app-prod"
 
   nginx:
     image: nginx:alpine
@@ -38,7 +38,7 @@ services:
       driver: gcplogs
       options:
         gcp-log-cmd: "true"
-        labels: "com.docker.compose.service"
+        tag: "prayer-wall-nginx-prod"
 
   certbot:
     image: certbot/certbot
@@ -51,4 +51,4 @@ services:
       driver: gcplogs
       options:
         gcp-log-cmd: "true"
-        labels: "com.docker.compose.service"
+        tag: "prayer-wall-certbot"
