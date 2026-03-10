@@ -24,7 +24,7 @@ export async function POST(request: Request) {
 
         // Fetch target group IDs from DB
         const settingsRes = await db.select().from(appSettings).where(eq(appSettings.key, 'whatsapp_group_ids'));
-        let groupIdsStr = settingsRes.length > 0 ? settingsRes[0].value : process.env.WHATSAPP_GROUP_ID;
+        const groupIdsStr = settingsRes.length > 0 ? settingsRes[0].value : process.env.WHATSAPP_GROUP_ID;
 
         if (groupIdsStr) {
             const groupIds = groupIdsStr.split(',').map(id => id.trim()).filter(id => id.length > 0);
