@@ -1,3 +1,6 @@
+import fs from 'fs';
+import path from 'path';
+
 import { Client, LocalAuth } from 'whatsapp-web.js';
 import qrcode from 'qrcode-terminal';
 
@@ -19,7 +22,14 @@ class WhatsAppService {
     constructor() {
         console.log('Constructing WhatsAppService instance...');
 
-        this.client = new Client({
+        this.client = this.createClient();
+
+        this.setupGracefulShutdown();
+        this.initialize();
+    }
+
+    private createClient(): Client {
+        const client = new Client({
             authStrategy: new LocalAuth({
                 dataPath: process.env.WA_DATA_PATH || './.wwebjs_auth',
             }),
@@ -40,37 +50,66 @@ class WhatsAppService {
             },
         });
 
-        this.client.on('qr', (qr) => {
+        client.on('qr', (qr) => {
             console.log('QR RECEIVED (length):', qr.length);
             this.latestQR = qr;
             // qrcode.generate(qr, { small: true });
         });
 
-        this.client.on('ready', () => {
+        client.on('ready', () => {
             console.log('WhatsApp Client is ready!');
             this.isReady = true;
             this.latestQR = null;
             this.isInitializing = false;
         });
 
-        this.client.on('authenticated', () => {
+        client.on('authenticated', () => {
             console.log('AUTHENTICATED');
             this.latestQR = null;
         });
 
-        this.client.on('auth_failure', (msg) => {
+        client.on('auth_failure', (msg) => {
             console.error('AUTHENTICATION FAILURE', msg);
             this.isInitializing = false;
         });
 
-        this.client.on('disconnected', (reason) => {
+        client.on('disconnected', (reason) => {
             console.warn('WhatsApp disconnected:', reason);
             this.isReady = false;
             this.isInitializing = false;
         });
 
-        this.setupGracefulShutdown();
-        this.initialize();
+        return client;
+    }
+
+    private getLockFilePath(): string {
+        const dataPath = process.env.WA_DATA_PATH || './.wwebjs_auth';
+        return path.join(dataPath, 'session', 'SingletonLock');
+    }
+
+    private clearStaleLock() {
+        const lockFile = this.getLockFilePath();
+        if (fs.existsSync(lockFile)) {
+            console.log('Removing stale SingletonLock...');
+            fs.rmSync(lockFile);
+        }
+    }
+
+    private waitForLockRelease(timeoutMs = 10000): Promise<void> {
+        const lockFile = this.getLockFilePath();
+        return new Promise((resolve) => {
+            const start = Date.now();
+            const check = () => {
+                if (!fs.existsSync(lockFile)) return resolve();
+                if (Date.now() - start > timeoutMs) {
+                    console.warn('Lock file still present after timeout, removing it forcefully...');
+                    try { fs.rmSync(lockFile); } catch (_) {}
+                    return resolve();
+                }
+                setTimeout(check, 200);
+            };
+            check();
+        });
     }
 
     public async initialize() {
@@ -79,6 +118,7 @@ class WhatsAppService {
             return;
         }
 
+        this.clearStaleLock();
         this.isInitializing = true;
         console.log('Initializing WhatsApp client...');
 
@@ -137,25 +177,35 @@ class WhatsAppService {
 
     public async logout(): Promise<boolean> {
         console.log('Attempting to logout WhatsApp client...');
-        try {
-            await this.client.logout();
-            console.log('WhatsApp client logged out successfully.');
-        } catch (error) {
-            console.error('Failed to logout WhatsApp client gracefully:', error);
-            console.log('Attempting to forcefully destroy WhatsApp client...');
+
+        if (this.isReady) {
             try {
-                await this.client.destroy();
-                console.log('WhatsApp client destroyed forcefully.');
-            } catch (destroyError) {
-                console.error('Failed to destroy WhatsApp client:', destroyError);
+                await this.client.logout();
+                console.log('WhatsApp client logged out successfully.');
+            } catch (error) {
+                console.error('Failed to logout WhatsApp client gracefully:', error);
             }
-        } finally {
-            this.isReady = false;
-            this.latestQR = null;
-            this.isInitializing = false;
-            console.log('Re-initializing WhatsApp client for new session...');
-            this.initialize();
+        } else {
+            console.log('Client not in ready state, skipping logout() call.');
         }
+
+        try {
+            await this.client.destroy();
+            console.log('WhatsApp client destroyed successfully.');
+        } catch (destroyError) {
+            console.error('Failed to destroy WhatsApp client:', destroyError);
+        }
+
+        this.isReady = false;
+        this.latestQR = null;
+        this.isInitializing = false;
+
+        console.log('Waiting for browser lock to be released...');
+        await this.waitForLockRelease();
+
+        console.log('Re-creating WhatsApp client for new session...');
+        this.client = this.createClient();
+        this.initialize();
         return true;
     }
 }

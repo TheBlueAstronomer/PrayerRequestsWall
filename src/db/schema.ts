@@ -7,6 +7,7 @@ export const prayerRequests = sqliteTable('prayer_requests', {
   createdAt: integer('created_at', { mode: 'timestamp' })
     .notNull()
     .default(sql`(unixepoch())`), // Store as timestamp
+  whatsappSent: integer('whatsapp_sent', { mode: 'boolean' }).notNull().default(false),
 });
 
 export const appSettings = sqliteTable('app_settings', {
