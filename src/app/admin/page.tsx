@@ -8,6 +8,7 @@ type Prayer = {
     id: number;
     content: string;
     createdAt: string;
+    whatsappSent: boolean;
 };
 
 export default function AdminPage() {
@@ -22,6 +23,7 @@ export default function AdminPage() {
     const [prayers, setPrayers] = useState<Prayer[]>([]);
     const [qrCodeData, setQrCodeData] = useState<string | null>(null);
     const [isLoggingOut, setIsLoggingOut] = useState(false);
+    const [resendingIds, setResendingIds] = useState<Set<number>>(new Set());
 
     const fetchSettings = useCallback(async () => {
         try {
@@ -158,6 +160,32 @@ export default function AdminPage() {
             }
         } catch (error) {
             console.error("Failed to delete prayer", error);
+        }
+    };
+
+    const resendPrayer = async (id: number) => {
+        setResendingIds(prev => new Set(prev).add(id));
+        try {
+            const res = await fetch("/api/admin/prayers/resend", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ id }),
+            });
+            const data = await res.json();
+            if (data.success) {
+                setPrayers(prev => prev.map(p => p.id === id ? { ...p, whatsappSent: true } : p));
+            } else {
+                alert(data.error || "Failed to resend. WhatsApp may not be connected.");
+            }
+        } catch (error) {
+            console.error("Failed to resend prayer", error);
+            alert("Failed to resend. Check console for details.");
+        } finally {
+            setResendingIds(prev => {
+                const next = new Set(prev);
+                next.delete(id);
+                return next;
+            });
         }
     };
 
@@ -314,13 +342,42 @@ export default function AdminPage() {
                                     </p>
                                     <p className="whitespace-pre-wrap text-slate-800 dark:text-slate-200">{prayer.content}</p>
                                 </div>
-                                <button
-                                    onClick={() => deletePrayer(prayer.id)}
-                                    className="p-2 text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg transition-colors flex items-center gap-1"
-                                    title="Delete Prayer"
-                                >
-                                    <span className="material-icons-round">delete</span>
-                                </button>
+                                <div className="flex items-center gap-1 flex-shrink-0">
+                                    {prayer.whatsappSent ? (
+                                        <span
+                                            className="flex items-center gap-1 px-2 py-1 rounded-md bg-green-50 dark:bg-green-900/20 text-green-600 dark:text-green-400 text-xs font-medium border border-green-200 dark:border-green-800"
+                                            title="Sent to WhatsApp"
+                                        >
+                                            <span className="material-icons-round text-sm">check_circle</span>
+                                            Sent
+                                        </span>
+                                    ) : (
+                                        <span
+                                            className="flex items-center gap-1 px-2 py-1 rounded-md bg-amber-50 dark:bg-amber-900/20 text-amber-600 dark:text-amber-400 text-xs font-medium border border-amber-200 dark:border-amber-800"
+                                            title="Not sent to WhatsApp"
+                                        >
+                                            <span className="material-icons-round text-sm">warning</span>
+                                            Not sent
+                                        </span>
+                                    )}
+                                    <button
+                                        onClick={() => resendPrayer(prayer.id)}
+                                        disabled={resendingIds.has(prayer.id)}
+                                        className="p-2 text-slate-500 hover:text-green-600 hover:bg-green-50 dark:hover:bg-green-900/20 dark:hover:text-green-400 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                        title="Resend to WhatsApp"
+                                    >
+                                        <span className="material-icons-round text-base">
+                                            {resendingIds.has(prayer.id) ? "sync" : "send"}
+                                        </span>
+                                    </button>
+                                    <button
+                                        onClick={() => deletePrayer(prayer.id)}
+                                        className="p-2 text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg transition-colors"
+                                        title="Delete Prayer"
+                                    >
+                                        <span className="material-icons-round">delete</span>
+                                    </button>
+                                </div>
                             </div>
                         ))}
                     </div>
