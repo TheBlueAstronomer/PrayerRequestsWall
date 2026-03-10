@@ -19,7 +19,7 @@ services:
       driver: gcplogs
       options:
         gcp-log-cmd: "true"
-        tag: "prayer-wall-app-prod"
+        gcp-meta-name: "prayer-wall-app-prod"
 
   nginx:
     image: nginx:alpine
@@ -38,7 +38,7 @@ services:
       driver: gcplogs
       options:
         gcp-log-cmd: "true"
-        tag: "prayer-wall-nginx-prod"
+        gcp-meta-name: "prayer-wall-nginx-prod"
 
   certbot:
     image: certbot/certbot
@@ -51,4 +51,4 @@ services:
       driver: gcplogs
       options:
         gcp-log-cmd: "true"
-        tag: "prayer-wall-certbot"
+        gcp-meta-name: "prayer-wall-certbot"
