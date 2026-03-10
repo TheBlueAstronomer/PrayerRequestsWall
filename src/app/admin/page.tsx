@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import Link from "next/link";
 import { QRCodeSVG } from 'qrcode.react';
 
@@ -23,16 +23,62 @@ export default function AdminPage() {
     const [qrCodeData, setQrCodeData] = useState<string | null>(null);
     const [isLoggingOut, setIsLoggingOut] = useState(false);
 
+    const fetchSettings = useCallback(async () => {
+        try {
+            const res = await fetch("/api/admin/settings");
+            const data = await res.json();
+            if (data.success) {
+                setGroupSetting(data.whatsapp_group_ids || "");
+                setSavedGroupSetting(data.whatsapp_group_ids || "");
+            }
+        } catch (error) {
+            console.error("Failed to fetch settings", error);
+        }
+    }, []);
+
+    const fetchPrayers = useCallback(async () => {
+        try {
+            const res = await fetch("/api/admin/prayers");
+            const data = await res.json();
+            if (data.success) {
+                setPrayers(data.prayers || []);
+            }
+        } catch (error) {
+            console.error("Failed to fetch prayers", error);
+        }
+    }, []);
+
+    const fetchQrCode = useCallback(async () => {
+        try {
+            const res = await fetch("/api/admin/qr");
+            const data = await res.json();
+            if (data.success) {
+                setQrCodeData(data.qr || null);
+            }
+        } catch (error) {
+            console.error("Failed to fetch QR code", error);
+        }
+    }, []);
+
     // Initial load logic if authenticated
     useEffect(() => {
-        if (isAuthenticated) {
+        if (!isAuthenticated) {
+            return;
+        }
+
+        const frame = requestAnimationFrame(() => {
             fetchSettings();
             fetchPrayers();
             fetchQrCode();
-            const qrInterval = setInterval(fetchQrCode, 5000);
-            return () => clearInterval(qrInterval);
-        }
-    }, [isAuthenticated]);
+        });
+
+        const qrInterval = setInterval(fetchQrCode, 5000);
+
+        return () => {
+            cancelAnimationFrame(frame);
+            clearInterval(qrInterval);
+        };
+    }, [isAuthenticated, fetchPrayers, fetchQrCode, fetchSettings]);
 
     const handleLogin = async (e: React.FormEvent) => {
         e.preventDefault();
@@ -50,20 +96,8 @@ export default function AdminPage() {
                 setAuthError("Invalid password");
             }
         } catch (error) {
+            console.error("Login failed", error);
             setAuthError("Login failed");
-        }
-    };
-
-    const fetchSettings = async () => {
-        try {
-            const res = await fetch("/api/admin/settings");
-            const data = await res.json();
-            if (data.success) {
-                setGroupSetting(data.whatsapp_group_ids || "");
-                setSavedGroupSetting(data.whatsapp_group_ids || "");
-            }
-        } catch (error) {
-            console.error("Failed to fetch settings", error);
         }
     };
 
@@ -83,6 +117,7 @@ export default function AdminPage() {
                 setSettingsMsg("Failed to save.");
             }
         } catch (error) {
+            console.error("Failed to save settings", error);
             setSettingsMsg("Error saving.");
         }
     };
@@ -109,19 +144,8 @@ export default function AdminPage() {
                 setSettingsMsg("Failed to remove ID.");
             }
         } catch (error) {
+            console.error("Failed to remove group ID", error);
             setSettingsMsg("Error removing ID.");
-        }
-    };
-
-    const fetchPrayers = async () => {
-        try {
-            const res = await fetch("/api/admin/prayers");
-            const data = await res.json();
-            if (data.success) {
-                setPrayers(data.prayers || []);
-            }
-        } catch (error) {
-            console.error("Failed to fetch prayers", error);
         }
     };
 
@@ -134,18 +158,6 @@ export default function AdminPage() {
             }
         } catch (error) {
             console.error("Failed to delete prayer", error);
-        }
-    };
-
-    const fetchQrCode = async () => {
-        try {
-            const res = await fetch("/api/admin/qr");
-            const data = await res.json();
-            if (data.success) {
-                setQrCodeData(data.qr || null);
-            }
-        } catch (error) {
-            console.error("Failed to fetch QR code", error);
         }
     };
 
@@ -164,8 +176,6 @@ export default function AdminPage() {
             alert("Failed to logout. Check console for details.");
         } finally {
             setIsLoggingOut(false);
-            // We don't need to manually clear state here because 
-            // the fetchQrCode interval will pick up the new QR code.
         }
     };
 
