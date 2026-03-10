@@ -1,5 +1,5 @@
 import React from 'react';
-import { render, screen, fireEvent, act } from '@testing-library/react';
+import { render, screen, fireEvent, act, cleanup } from '@testing-library/react';
 import { ThemeToggle } from '@/components/ThemeToggle';
 
 const mockSetTheme = jest.fn();
@@ -25,10 +25,21 @@ beforeAll(() => {
     global.cancelAnimationFrame = () => { rafCallback = null; };
 });
 
+afterEach(() => {
+    mockSetTheme.mockClear();
+    cleanup();
+});
+
 afterAll(() => {
     global.requestAnimationFrame = originalRaf;
     global.cancelAnimationFrame = originalCaf;
 });
+
+/** Render before rAF fires (mounted === false). */
+function renderUnmounted(theme: string, systemTheme: string) {
+    mockUseTheme.mockReturnValue({ theme, setTheme: mockSetTheme, systemTheme });
+    return render(<ThemeToggle />);
+}
 
 /** Render and flush the rAF so mounted becomes true. */
 function renderMounted(theme: string, systemTheme: string) {
@@ -37,7 +48,6 @@ function renderMounted(theme: string, systemTheme: string) {
     act(() => {
         result = render(<ThemeToggle />);
     });
-    // Now fire the captured rAF callback inside act to flush setState
     act(() => {
         if (rafCallback) rafCallback(0);
         rafCallback = null;
@@ -46,49 +56,100 @@ function renderMounted(theme: string, systemTheme: string) {
 }
 
 describe('ThemeToggle', () => {
-    it('renders nothing before requestAnimationFrame fires (not yet mounted)', () => {
-        mockUseTheme.mockReturnValue({ theme: 'light', setTheme: mockSetTheme, systemTheme: 'light' });
-        const { container } = render(<ThemeToggle />);
-        // rAF has not been fired yet — mounted is still false
-        expect(container.firstChild).toBeNull();
-        // clean up pending rAF
-        act(() => { if (rafCallback) rafCallback(0); rafCallback = null; });
+    describe('before mount (rAF not yet fired)', () => {
+        it('renders a skeleton placeholder div, not the interactive button', () => {
+            const { container } = renderUnmounted('light', 'light');
+            expect(screen.queryByRole('button', { name: /toggle theme/i })).toBeNull();
+            const skeleton = container.firstChild as HTMLElement;
+            expect(skeleton).toHaveClass('fixed', 'top-0', 'z-50', 'flex', 'items-center');
+            expect(skeleton).toHaveStyle({ height: '64px' });
+            expect(skeleton.firstChild).toHaveStyle({ width: '72px', height: '34px' });
+            act(() => { if (rafCallback) rafCallback(0); });
+        });
     });
 
-    it('renders the toggle button after mount', () => {
-        renderMounted('light', 'light');
-        expect(screen.getByRole('button', { name: /toggle theme/i })).toBeInTheDocument();
+    describe('after mount', () => {
+        it('renders the toggle button with aria-label', () => {
+            renderMounted('light', 'light');
+            expect(screen.getByRole('button', { name: /toggle theme/i })).toBeInTheDocument();
+        });
+
+        it('does NOT render the stars SVG in light mode', () => {
+            renderMounted('light', 'light');
+            expect(screen.queryByTestId('stars-svg')).toBeNull();
+        });
+
+        it('renders the stars SVG in dark mode', () => {
+            renderMounted('dark', 'dark');
+            expect(screen.getByTestId('stars-svg')).toBeInTheDocument();
+        });
+
+        it('renders star polygons with correct attributes inside the SVG in dark mode', () => {
+            renderMounted('dark', 'dark');
+            const polygons = screen.getByTestId('stars-svg').querySelectorAll('polygon');
+            expect(polygons.length).toBe(7);
+            polygons.forEach((poly) => {
+                expect(poly).toHaveAttribute('fill', 'white');
+                const points = poly.getAttribute('points');
+                expect(points).toBeTruthy();
+                expect(points!.split(' ').length).toBe(10);
+            });
+        });
+
+        it('renders the sun gradient in light mode', () => {
+            const { container } = renderMounted('light', 'light');
+            const knobDivs = container.querySelectorAll('.rounded-full');
+            const sunDiv = Array.from(knobDivs).find(el =>
+                (el as HTMLElement).style.background?.includes('#ffe066')
+            );
+            expect(sunDiv).toBeDefined();
+        });
+
+        it('renders the moon gradient in dark mode', () => {
+            const { container } = renderMounted('dark', 'dark');
+            const knobDivs = container.querySelectorAll('.rounded-full');
+            const moonDiv = Array.from(knobDivs).find(el =>
+                (el as HTMLElement).style.background?.includes('#d8d8d8')
+            );
+            expect(moonDiv).toBeDefined();
+        });
+
+        it('resolves system theme to light — no stars SVG', () => {
+            renderMounted('system', 'light');
+            expect(screen.queryByTestId('stars-svg')).toBeNull();
+        });
+
+        it('resolves system theme to dark — stars SVG present with correct star count', () => {
+            renderMounted('system', 'dark');
+            const svg = screen.getByTestId('stars-svg');
+            expect(svg).toBeInTheDocument();
+            expect(svg.querySelectorAll('polygon').length).toBe(7);
+        });
     });
 
-    it('shows dark_mode icon when current theme is light', () => {
-        renderMounted('light', 'light');
-        expect(screen.getByText('dark_mode')).toBeInTheDocument();
-    });
+    describe('click behaviour', () => {
+        it('calls setTheme("dark") when current theme is light', () => {
+            renderMounted('light', 'light');
+            fireEvent.click(screen.getByRole('button', { name: /toggle theme/i }));
+            expect(mockSetTheme).toHaveBeenCalledWith('dark');
+        });
 
-    it('shows light_mode icon when current theme is dark', () => {
-        renderMounted('dark', 'dark');
-        expect(screen.getByText('light_mode')).toBeInTheDocument();
-    });
+        it('calls setTheme("light") when current theme is dark', () => {
+            renderMounted('dark', 'dark');
+            fireEvent.click(screen.getByRole('button', { name: /toggle theme/i }));
+            expect(mockSetTheme).toHaveBeenCalledWith('light');
+        });
 
-    it('resolves system theme to light and shows dark_mode icon', () => {
-        renderMounted('system', 'light');
-        expect(screen.getByText('dark_mode')).toBeInTheDocument();
-    });
+        it('calls setTheme("light") when system theme resolves to dark', () => {
+            renderMounted('system', 'dark');
+            fireEvent.click(screen.getByRole('button', { name: /toggle theme/i }));
+            expect(mockSetTheme).toHaveBeenCalledWith('light');
+        });
 
-    it('resolves system theme to dark and shows light_mode icon', () => {
-        renderMounted('system', 'dark');
-        expect(screen.getByText('light_mode')).toBeInTheDocument();
-    });
-
-    it('calls setTheme("dark") when current theme is light and button is clicked', () => {
-        renderMounted('light', 'light');
-        fireEvent.click(screen.getByRole('button', { name: /toggle theme/i }));
-        expect(mockSetTheme).toHaveBeenCalledWith('dark');
-    });
-
-    it('calls setTheme("light") when current theme is dark and button is clicked', () => {
-        renderMounted('dark', 'dark');
-        fireEvent.click(screen.getByRole('button', { name: /toggle theme/i }));
-        expect(mockSetTheme).toHaveBeenCalledWith('light');
+        it('calls setTheme("dark") when system theme resolves to light', () => {
+            renderMounted('system', 'light');
+            fireEvent.click(screen.getByRole('button', { name: /toggle theme/i }));
+            expect(mockSetTheme).toHaveBeenCalledWith('dark');
+        });
     });
 });
