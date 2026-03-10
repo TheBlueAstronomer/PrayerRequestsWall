@@ -49,6 +49,8 @@ steps:
           gcloud auth configure-docker ${_ARTIFACT_REGION}-docker.pkg.dev --quiet && \
           export PROJECT_ID=$PROJECT_ID && \
           docker-compose -f docker-compose.prod.yml pull && \
+          docker-compose -f docker-compose.prod.yml stop app && \
+          docker-compose -f docker-compose.prod.yml rm -f app && \
           docker-compose -f docker-compose.prod.yml up -d'"
     id: 'deploy-vm'
 

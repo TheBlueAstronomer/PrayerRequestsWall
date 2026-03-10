@@ -56,6 +56,12 @@ RUN npm run build
 
 # Create startup script
 RUN echo '#!/bin/sh\n\
+set -e\n\
+AUTH_DIR="${WA_DATA_PATH:-/app/.wwebjs_auth}"\n\
+if [ -d "$AUTH_DIR" ]; then\n\
+  echo "Cleaning stale Chromium lock files in $AUTH_DIR..."\n\
+  find "$AUTH_DIR" -maxdepth 2 -type f \( -name "Singleton*" -o -name "Lockfile" -o -name "ChromeSingleton*" \) -print -delete || true\n\
+fi\n\
 echo "Running database migrations..."\n\
 npm run db:push\n\
 echo "Starting application..."\n\
