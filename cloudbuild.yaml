@@ -54,9 +54,8 @@ steps:
           docker-compose -f docker-compose.prod.yml up -d'"
 
         # Remove stale deploy-user ephemeral keys from project metadata to prevent accumulation
-        CURRENT_KEYS=$(gcloud compute project-info describe --project=$PROJECT_ID --format="value(commonInstanceMetadata.items['ssh-keys'])")
-        CLEANED_KEYS=$(echo "$CURRENT_KEYS" | grep -v "^deploy-user:")
-        echo "$CLEANED_KEYS" > /tmp/ssh_keys_cleaned.txt
+        current_keys=$(gcloud compute project-info describe --project=$PROJECT_ID --format="value(commonInstanceMetadata.items['ssh-keys'])")
+        echo "$current_keys" | grep -v "^deploy-user:" > /tmp/ssh_keys_cleaned.txt
         gcloud compute project-info add-metadata --project=$PROJECT_ID --metadata-from-file=ssh-keys=/tmp/ssh_keys_cleaned.txt
     id: 'deploy-vm'
 
