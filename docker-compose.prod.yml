@@ -15,6 +15,11 @@ services:
       - NODE_ENV=production
     env_file:
       - /var/intercessor/app/.env
+    logging:
+      driver: gcplogs
+      options:
+        gcp-log-cmd: "true"
+        labels: "com.docker.compose.service"
 
   nginx:
     image: nginx:alpine
@@ -29,6 +34,11 @@ services:
       - /var/intercessor/data/certbot/www:/var/www/certbot
     depends_on:
       - app
+    logging:
+      driver: gcplogs
+      options:
+        gcp-log-cmd: "true"
+        labels: "com.docker.compose.service"
 
   certbot:
     image: certbot/certbot
@@ -37,3 +47,8 @@ services:
       - /var/intercessor/data/certbot/conf:/etc/letsencrypt
       - /var/intercessor/data/certbot/www:/var/www/certbot
     entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done;'"
+    logging:
+      driver: gcplogs
+      options:
+        gcp-log-cmd: "true"
+        labels: "com.docker.compose.service"
