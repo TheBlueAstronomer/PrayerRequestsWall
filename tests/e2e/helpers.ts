@@ -54,13 +54,13 @@ export function mockQrApi(page: Page, qr: string | null) {
 }
 
 /** Intercept GET /api/admin/settings */
-export function mockSettingsGetApi(page: Page, groupIds = '') {
+export function mockSettingsGetApi(page: Page, groupIds = '', testGroupId = '') {
     return page.route('**/api/admin/settings', route => {
         if (route.request().method() === 'GET') {
             return route.fulfill({
                 status: 200,
                 contentType: 'application/json',
-                body: JSON.stringify({ success: true, whatsapp_group_ids: groupIds }),
+                body: JSON.stringify({ success: true, whatsapp_group_ids: groupIds, whatsapp_test_group_id: testGroupId }),
             });
         }
         return route.continue();
@@ -110,11 +110,11 @@ export async function loginAdmin(page: Page, password = 'root') {
 /** Stub all admin data-fetch APIs so the dashboard renders cleanly. */
 export async function stubAdminApis(
     page: Page,
-    opts: { prayers?: object[]; qr?: string | null; groupIds?: string } = {}
+    opts: { prayers?: object[]; qr?: string | null; groupIds?: string; testGroupId?: string } = {}
 ) {
-    const { prayers = [], qr = null, groupIds = '' } = opts;
+    const { prayers = [], qr = null, groupIds = '', testGroupId = '' } = opts;
     await mockAuthApi(page, { success: true, token: 'admin_token_temp' });
     await mockPrayersApi(page, prayers);
     await mockQrApi(page, qr);
-    await mockSettingsGetApi(page, groupIds);
+    await mockSettingsGetApi(page, groupIds, testGroupId);
 }

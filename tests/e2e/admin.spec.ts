@@ -131,6 +131,12 @@ test.describe('Admin — WhatsApp Configuration', () => {
         await expect(page.locator('input[placeholder*="12036312345678"]')).toHaveValue('');
     });
 
+    test('test group ID input is pre-filled from API', async ({ page }) => {
+        await stubAdminApis(page, { testGroupId: 'test-group@g.us' });
+        await loginAdmin(page);
+        await expect(page.getByLabel(/test group\/chat id/i)).toHaveValue('test-group@g.us');
+    });
+
     test('shows "Save Settings" button', async ({ page }) => {
         await stubAdminApis(page);
         await loginAdmin(page);
@@ -146,6 +152,36 @@ test.describe('Admin — WhatsApp Configuration', () => {
         await input.fill('newgroup@g.us');
         await page.getByRole('button', { name: /save settings/i }).click();
         await expect(page.getByText(/settings saved/i)).toBeVisible();
+    });
+
+    test('saving settings includes the test group ID', async ({ page }) => {
+        await stubAdminApis(page, { groupIds: '', testGroupId: '' });
+        let requestBody: Record<string, unknown> | null = null;
+        await page.route('**/api/admin/settings', async route => {
+            if (route.request().method() === 'GET') {
+                return route.fulfill({
+                    status: 200,
+                    contentType: 'application/json',
+                    body: JSON.stringify({ success: true, whatsapp_group_ids: '', whatsapp_test_group_id: '' }),
+                });
+            }
+            if (route.request().method() === 'POST') {
+                requestBody = route.request().postDataJSON();
+                return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ success: true }) });
+            }
+            return route.continue();
+        });
+        await loginAdmin(page);
+
+        await page.getByLabel(/^group\/chat ids$/i).fill('main@g.us');
+        await page.getByLabel(/test group\/chat id/i).fill('test@g.us');
+        await page.getByRole('button', { name: /save settings/i }).click();
+
+        await expect(page.getByText(/settings saved/i)).toBeVisible();
+        expect(requestBody).toMatchObject({
+            whatsapp_group_ids: 'main@g.us',
+            whatsapp_test_group_id: 'test@g.us',
+        });
     });
 
     test('shows "Saving..." while save is in flight', async ({ page }) => {
@@ -344,6 +380,13 @@ test.describe('Admin — Prayer Requests List', () => {
         await expect(resendButtons).toHaveCount(SAMPLE_PRAYERS.length);
     });
 
+    test('each prayer row has a send to test group button', async ({ page }) => {
+        await stubAdminApis(page, { prayers: SAMPLE_PRAYERS });
+        await loginAdmin(page);
+        const testSendButtons = page.locator('button[title="Send to Test Group"]');
+        await expect(testSendButtons).toHaveCount(SAMPLE_PRAYERS.length);
+    });
+
     // ── Delete prayer ───────────────────────────────────────────────────────
 
     test('clicking Delete opens a confirm dialog', async ({ page }) => {
@@ -415,6 +458,28 @@ test.describe('Admin — Prayer Requests List', () => {
         await page.locator('button[title="Resend to WhatsApp"]').first().click();
         await page.waitForTimeout(400);
         expect(resendCalled).toBe(true);
+    });
+
+    test('clicking Send to Test Group posts test target without changing the sent badge', async ({ page }) => {
+        const unsent = [{ id: 10, content: 'Please preview me', createdAt: new Date().toISOString(), whatsappSent: false }];
+        await stubAdminApis(page, { prayers: unsent, testGroupId: 'test@g.us' });
+        let requestBody: Record<string, unknown> | null = null;
+        await page.route('**/api/admin/prayers/resend', async route => {
+            requestBody = route.request().postDataJSON();
+            return route.fulfill({
+                status: 200,
+                contentType: 'application/json',
+                body: JSON.stringify({ success: true, partialFailure: false }),
+            });
+        });
+        await loginAdmin(page);
+
+        await expect(page.getByText('Not sent')).toBeVisible();
+        await page.locator('button[title="Send to Test Group"]').click();
+
+        expect(requestBody).toMatchObject({ id: 10, target: 'test' });
+        await expect(page.getByText('Not sent')).toBeVisible();
+        await expect(page.locator('[title="Sent to WhatsApp"]')).not.toBeVisible();
     });
 
     test('successful resend updates the badge from "Not sent" to "Sent"', async ({ page }) => {

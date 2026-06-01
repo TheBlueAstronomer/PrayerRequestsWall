@@ -94,6 +94,60 @@ describe('POST /api/admin/prayers/resend', () => {
         expect(mockSendMessage).toHaveBeenCalledTimes(2);
     });
 
+    it('sends to the test group without marking whatsappSent=true', async () => {
+        const prayer = { id: 7, content: 'Preview this request', whatsappSent: false };
+        chainSelectSequence([[prayer], [{ key: 'whatsapp_test_group_id', value: 'test@g.us' }]]);
+        mockSendMessage.mockResolvedValue(true);
+
+        const response = await POST(makeRequest({ id: 7, target: 'test' }));
+        const json = await response.json();
+
+        expect(response.status).toBe(200);
+        expect(json.success).toBe(true);
+        expect(json.partialFailure).toBe(false);
+        expect(mockSendMessage).toHaveBeenCalledWith('test@g.us', '🙏 *New Anonymous Request:* Preview this request');
+        expect(mockDbUpdate).not.toHaveBeenCalled();
+    });
+
+    it('falls back to WHATSAPP_TEST_GROUP_ID env for test sends when DB setting is absent', async () => {
+        process.env.WHATSAPP_TEST_GROUP_ID = 'env-test@g.us';
+        const prayer = { id: 8, content: 'Env preview', whatsappSent: false };
+        chainSelectSequence([[prayer], []]);
+        mockSendMessage.mockResolvedValue(true);
+
+        const response = await POST(makeRequest({ id: 8, target: 'test' }));
+        const json = await response.json();
+
+        expect(response.status).toBe(200);
+        expect(json.success).toBe(true);
+        expect(mockSendMessage).toHaveBeenCalledWith('env-test@g.us', expect.any(String));
+        expect(mockDbUpdate).not.toHaveBeenCalled();
+
+        delete process.env.WHATSAPP_TEST_GROUP_ID;
+    });
+
+    it('returns 400 when no WhatsApp test group is configured', async () => {
+        delete process.env.WHATSAPP_TEST_GROUP_ID;
+        const prayer = { id: 9, content: 'Missing test target', whatsappSent: false };
+        chainSelectSequence([[prayer], []]);
+
+        const response = await POST(makeRequest({ id: 9, target: 'test' }));
+        const json = await response.json();
+
+        expect(response.status).toBe(400);
+        expect(json.error).toBe('No WhatsApp test group configured');
+        expect(mockSendMessage).not.toHaveBeenCalled();
+    });
+
+    it('returns 400 when target is invalid', async () => {
+        const response = await POST(makeRequest({ id: 10, target: 'archive' }));
+        const json = await response.json();
+
+        expect(response.status).toBe(400);
+        expect(json.error).toBe('Invalid target');
+        expect(mockDbSelect).not.toHaveBeenCalled();
+    });
+
     it('returns partialFailure:true when one group send fails', async () => {
         const prayer = { id: 3, content: 'Guidance', whatsappSent: false };
         chainSelectSequence([[prayer], [{ key: 'whatsapp_group_ids', value: 'g1@g.us, g2@g.us' }]]);

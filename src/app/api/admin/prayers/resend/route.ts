@@ -7,10 +7,14 @@ import { eq } from 'drizzle-orm';
 export async function POST(request: Request) {
     try {
         const body = await request.json();
-        const { id } = body;
+        const { id, target = 'main' } = body;
 
         if (!id || typeof id !== 'number') {
             return NextResponse.json({ error: 'Missing or invalid id' }, { status: 400 });
+        }
+
+        if (target !== 'main' && target !== 'test') {
+            return NextResponse.json({ error: 'Invalid target' }, { status: 400 });
         }
 
         const rows = await db.select().from(prayerRequests).where(eq(prayerRequests.id, id));
@@ -20,9 +24,20 @@ export async function POST(request: Request) {
 
         const prayer = rows[0];
 
+        if (target === 'test') {
+            const settingsRes = await db.select().from(appSettings).where(eq(appSettings.key, 'whatsapp_test_group_id'));
+            const testGroupId = (settingsRes.length > 0 ? settingsRes[0].value : process.env.WHATSAPP_TEST_GROUP_ID)?.trim();
+
+            if (!testGroupId) {
+                return NextResponse.json({ error: 'No WhatsApp test group configured' }, { status: 400 });
+            }
+
+            const sent = await whatsappService?.sendMessage(testGroupId, `🙏 *New Anonymous Request:* ${prayer.content}`);
+            return NextResponse.json({ success: !!sent, partialFailure: !sent });
+        }
+
         const settingsRes = await db.select().from(appSettings).where(eq(appSettings.key, 'whatsapp_group_ids'));
         const groupIdsStr = settingsRes.length > 0 ? settingsRes[0].value : process.env.WHATSAPP_GROUP_ID;
-
         if (!groupIdsStr) {
             return NextResponse.json({ error: 'No WhatsApp groups configured' }, { status: 400 });
         }

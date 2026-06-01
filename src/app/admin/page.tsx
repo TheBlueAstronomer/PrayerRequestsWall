@@ -18,12 +18,14 @@ export default function AdminPage() {
 
     const [groupSetting, setGroupSetting] = useState("");
     const [savedGroupSetting, setSavedGroupSetting] = useState("");
+    const [testGroupSetting, setTestGroupSetting] = useState("");
     const [settingsMsg, setSettingsMsg] = useState("");
 
     const [prayers, setPrayers] = useState<Prayer[]>([]);
     const [qrCodeData, setQrCodeData] = useState<string | null>(null);
     const [isLoggingOut, setIsLoggingOut] = useState(false);
     const [resendingIds, setResendingIds] = useState<Set<number>>(new Set());
+    const [testSendingIds, setTestSendingIds] = useState<Set<number>>(new Set());
 
     const fetchSettings = useCallback(async () => {
         try {
@@ -32,6 +34,7 @@ export default function AdminPage() {
             if (data.success) {
                 setGroupSetting(data.whatsapp_group_ids || "");
                 setSavedGroupSetting(data.whatsapp_group_ids || "");
+                setTestGroupSetting(data.whatsapp_test_group_id || "");
             }
         } catch (error) {
             console.error("Failed to fetch settings", error);
@@ -109,7 +112,10 @@ export default function AdminPage() {
             const res = await fetch("/api/admin/settings", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ whatsapp_group_ids: groupSetting }),
+                body: JSON.stringify({
+                    whatsapp_group_ids: groupSetting,
+                    whatsapp_test_group_id: testGroupSetting,
+                }),
             });
             if (res.ok) {
                 setSettingsMsg("Settings saved!");
@@ -135,7 +141,10 @@ export default function AdminPage() {
             const res = await fetch("/api/admin/settings", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ whatsapp_group_ids: newSetting }),
+                body: JSON.stringify({
+                    whatsapp_group_ids: newSetting,
+                    whatsapp_test_group_id: testGroupSetting,
+                }),
             });
             if (res.ok) {
                 setGroupSetting(newSetting);
@@ -182,6 +191,30 @@ export default function AdminPage() {
             alert("Failed to resend. Check console for details.");
         } finally {
             setResendingIds(prev => {
+                const next = new Set(prev);
+                next.delete(id);
+                return next;
+            });
+        }
+    };
+
+    const sendPrayerToTestGroup = async (id: number) => {
+        setTestSendingIds(prev => new Set(prev).add(id));
+        try {
+            const res = await fetch("/api/admin/prayers/resend", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ id, target: "test" }),
+            });
+            const data = await res.json();
+            if (!data.success) {
+                alert(data.error || "Failed to send to test group. WhatsApp may not be connected.");
+            }
+        } catch (error) {
+            console.error("Failed to send prayer to test group", error);
+            alert("Failed to send to test group. Check console for details.");
+        } finally {
+            setTestSendingIds(prev => {
                 const next = new Set(prev);
                 next.delete(id);
                 return next;
@@ -248,20 +281,42 @@ export default function AdminPage() {
                         <span className="material-icons-round text-primary">settings</span>
                         WhatsApp Configuration
                     </h2>
-                    <div className="flex flex-col gap-3">
-                        <label className="text-sm font-medium text-slate-700 dark:text-slate-300">
-                            Group/Chat IDs (comma-separated if multiple):
-                        </label>
-                        <input
-                            type="text"
-                            value={groupSetting}
-                            onChange={(e) => setGroupSetting(e.target.value)}
-                            className="w-full p-3 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 focus:ring-2 focus:ring-primary outline-none"
-                            placeholder="e.g. 12036312345678@g.us"
-                        />
+                    <div className="flex flex-col gap-4">
+                        <div className="flex flex-col gap-2">
+                            <label htmlFor="whatsapp-group-ids" className="text-sm font-medium text-slate-700 dark:text-slate-300">
+                                Group/Chat IDs
+                            </label>
+                            <input
+                                id="whatsapp-group-ids"
+                                type="text"
+                                value={groupSetting}
+                                onChange={(e) => setGroupSetting(e.target.value)}
+                                className="w-full p-3 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 focus:ring-2 focus:ring-primary outline-none transition-transform active:scale-[0.99]"
+                                placeholder="e.g. 12036312345678@g.us"
+                            />
+                            <p className="text-xs text-slate-500 dark:text-slate-400">
+                                Use commas to send new requests to more than one main group.
+                            </p>
+                        </div>
+                        <div className="flex flex-col gap-2">
+                            <label htmlFor="whatsapp-test-group-id" className="text-sm font-medium text-slate-700 dark:text-slate-300">
+                                Test Group/Chat ID
+                            </label>
+                            <input
+                                id="whatsapp-test-group-id"
+                                type="text"
+                                value={testGroupSetting}
+                                onChange={(e) => setTestGroupSetting(e.target.value)}
+                                className="w-full p-3 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 focus:ring-2 focus:ring-primary outline-none transition-transform active:scale-[0.99]"
+                                placeholder="e.g. 12036398765432@g.us"
+                            />
+                            <p className="text-xs text-slate-500 dark:text-slate-400">
+                                Use one destination for admin test messages.
+                            </p>
+                        </div>
                         <button
                             onClick={saveSettings}
-                            className="bg-primary text-white py-2 px-4 rounded-lg font-medium hover:bg-primary/90 self-start"
+                            className="bg-primary text-white py-2 px-4 rounded-lg font-medium hover:bg-primary/90 self-start transition-transform active:scale-[0.98]"
                         >
                             Save Settings
                         </button>
@@ -335,14 +390,14 @@ export default function AdminPage() {
                 ) : (
                     <div className="flex flex-col gap-4">
                         {prayers.map((prayer) => (
-                            <div key={prayer.id} className="p-4 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/50 flex justify-between items-start gap-4">
+                            <div key={prayer.id} className="p-4 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/50 flex flex-col sm:flex-row sm:justify-between sm:items-start gap-4">
                                 <div className="flex-1">
                                     <p className="text-sm text-slate-500 mb-1">
                                         {new Date(prayer.createdAt).toLocaleString()}
                                     </p>
                                     <p className="whitespace-pre-wrap text-slate-800 dark:text-slate-200">{prayer.content}</p>
                                 </div>
-                                <div className="flex items-center gap-1 flex-shrink-0">
+                                <div className="flex items-center gap-1 flex-wrap sm:flex-nowrap flex-shrink-0">
                                     {prayer.whatsappSent ? (
                                         <span
                                             className="flex items-center gap-1 px-2 py-1 rounded-md bg-green-50 dark:bg-green-900/20 text-green-600 dark:text-green-400 text-xs font-medium border border-green-200 dark:border-green-800"
@@ -363,7 +418,7 @@ export default function AdminPage() {
                                     <button
                                         onClick={() => resendPrayer(prayer.id)}
                                         disabled={resendingIds.has(prayer.id)}
-                                        className="p-2 text-slate-500 hover:text-green-600 hover:bg-green-50 dark:hover:bg-green-900/20 dark:hover:text-green-400 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                        className="p-2 text-slate-500 hover:text-green-600 hover:bg-green-50 dark:hover:bg-green-900/20 dark:hover:text-green-400 rounded-lg transition-all active:scale-[0.95] disabled:opacity-50 disabled:cursor-not-allowed"
                                         title="Resend to WhatsApp"
                                     >
                                         <span className="material-icons-round text-base">
@@ -371,8 +426,18 @@ export default function AdminPage() {
                                         </span>
                                     </button>
                                     <button
+                                        onClick={() => sendPrayerToTestGroup(prayer.id)}
+                                        disabled={testSendingIds.has(prayer.id)}
+                                        className="p-2 text-slate-500 hover:text-primary hover:bg-primary/10 rounded-lg transition-all active:scale-[0.95] disabled:opacity-50 disabled:cursor-not-allowed"
+                                        title="Send to Test Group"
+                                    >
+                                        <span className="material-icons-round text-base">
+                                            {testSendingIds.has(prayer.id) ? "sync" : "science"}
+                                        </span>
+                                    </button>
+                                    <button
                                         onClick={() => deletePrayer(prayer.id)}
-                                        className="p-2 text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg transition-colors"
+                                        className="p-2 text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg transition-all active:scale-[0.95]"
                                         title="Delete Prayer"
                                     >
                                         <span className="material-icons-round">delete</span>
