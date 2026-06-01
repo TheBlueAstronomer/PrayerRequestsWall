@@ -16,7 +16,6 @@ class WhatsAppService {
         this.client = this.createClient();
 
         this.setupGracefulShutdown();
-        this.initialize();
     }
 
     private createClient(): Client {
@@ -213,6 +212,10 @@ const globalForWhatsApp = globalThis as unknown as { whatsappGlobal: WhatsAppSer
 
 if (!globalForWhatsApp.whatsappGlobal && !isBuild) {
     globalForWhatsApp.whatsappGlobal = new WhatsAppService();
+    // Initialize asynchronously without blocking exports
+    globalForWhatsApp.whatsappGlobal.initialize().catch(err => {
+        console.error('[WA:init] Failed to initialize WhatsApp service:', err);
+    });
 }
 
 const whatsappService = globalForWhatsApp.whatsappGlobal!;

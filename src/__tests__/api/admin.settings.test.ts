@@ -28,6 +28,18 @@ function chainSelect(rows: unknown[]) {
     return chain;
 }
 
+function chainSelectSequence(rowSets: unknown[][]) {
+    let callCount = 0;
+    mockDbSelect.mockImplementation(() => {
+        const rows = rowSets[callCount] ?? [];
+        callCount++;
+        return {
+            from: jest.fn().mockReturnThis(),
+            where: jest.fn().mockResolvedValue(rows),
+        };
+    });
+}
+
 function chainInsert() {
     const chain = { values: jest.fn().mockResolvedValue(undefined) };
     mockDbInsert.mockReturnValue(chain);
@@ -60,6 +72,21 @@ describe('GET /api/admin/settings', () => {
         expect(response.status).toBe(200);
         expect(json.success).toBe(true);
         expect(json.whatsapp_group_ids).toBe('123@g.us,456@g.us');
+    });
+
+    it('returns existing whatsapp_test_group_id from DB', async () => {
+        chainSelectSequence([
+            [{ key: 'whatsapp_group_ids', value: '123@g.us' }],
+            [{ key: 'whatsapp_test_group_id', value: 'test@g.us' }],
+        ]);
+
+        const response = await GET();
+        const json = await response.json();
+
+        expect(response.status).toBe(200);
+        expect(json.success).toBe(true);
+        expect(json.whatsapp_group_ids).toBe('123@g.us');
+        expect(json.whatsapp_test_group_id).toBe('test@g.us');
     });
 
     it('returns empty string when no setting found', async () => {
@@ -101,6 +128,38 @@ describe('POST /api/admin/settings', () => {
         expect(updateChain.set).toHaveBeenCalledWith({ value: 'new@g.us' });
     });
 
+    it('updates existing test group setting when record exists', async () => {
+        chainSelectSequence([
+            [{ key: 'whatsapp_group_ids', value: 'old-value' }],
+            [{ key: 'whatsapp_test_group_id', value: 'old-test@g.us' }],
+        ]);
+        const updateChain = chainUpdate();
+
+        const response = await POST(makePostRequest({
+            whatsapp_group_ids: 'new@g.us',
+            whatsapp_test_group_id: 'new-test@g.us',
+        }));
+        const json = await response.json();
+
+        expect(response.status).toBe(200);
+        expect(json.success).toBe(true);
+        expect(updateChain.set).toHaveBeenCalledWith({ value: 'new@g.us' });
+        expect(updateChain.set).toHaveBeenCalledWith({ value: 'new-test@g.us' });
+    });
+
+    it('does not update the test group setting when it is omitted from the request', async () => {
+        chainSelect([{ key: 'whatsapp_group_ids', value: 'old-value' }]);
+        const updateChain = chainUpdate();
+
+        const response = await POST(makePostRequest({ whatsapp_group_ids: 'new@g.us' }));
+        const json = await response.json();
+
+        expect(response.status).toBe(200);
+        expect(json.success).toBe(true);
+        expect(updateChain.set).toHaveBeenCalledTimes(1);
+        expect(updateChain.set).toHaveBeenCalledWith({ value: 'new@g.us' });
+    });
+
     it('inserts new setting when no record exists', async () => {
         chainSelect([]);
         const insertChain = chainInsert();
@@ -113,6 +172,24 @@ describe('POST /api/admin/settings', () => {
         expect(insertChain.values).toHaveBeenCalledWith({
             key: 'whatsapp_group_ids',
             value: 'new@g.us',
+        });
+    });
+
+    it('inserts new test group setting when no record exists', async () => {
+        chainSelectSequence([[], []]);
+        const insertChain = chainInsert();
+
+        const response = await POST(makePostRequest({
+            whatsapp_group_ids: 'new@g.us',
+            whatsapp_test_group_id: 'test@g.us',
+        }));
+        const json = await response.json();
+
+        expect(response.status).toBe(200);
+        expect(json.success).toBe(true);
+        expect(insertChain.values).toHaveBeenCalledWith({
+            key: 'whatsapp_test_group_id',
+            value: 'test@g.us',
         });
     });
 
@@ -137,6 +214,14 @@ describe('POST /api/admin/settings', () => {
 
     it('returns 400 when whatsapp_group_ids is missing', async () => {
         const response = await POST(makePostRequest({}));
+        const json = await response.json();
+
+        expect(response.status).toBe(400);
+        expect(json.error).toBe('Invalid group IDs');
+    });
+
+    it('returns 400 when whatsapp_test_group_id is not a string', async () => {
+        const response = await POST(makePostRequest({ whatsapp_group_ids: 'id@g.us', whatsapp_test_group_id: 123 }));
         const json = await response.json();
 
         expect(response.status).toBe(400);
