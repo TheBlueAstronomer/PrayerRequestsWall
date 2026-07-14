@@ -54,7 +54,7 @@ async function loadFreshService(applyState?: (s: MockState) => void) {
     delete (globalThis as Record<string, unknown>).whatsappGlobal;
     delete process.env.npm_lifecycle_event;
 
-    let svc: { latestQR: string | null; sendMessage: (c: string, m: string) => Promise<boolean>; logout: () => Promise<boolean>; initialize: () => Promise<void> };
+    let svc: { latestQR: string | null; sendMessage: (c: string, m: string) => Promise<boolean>; logout: () => Promise<boolean>; initialize: () => Promise<void>; isConnected: () => boolean };
 
     await jest.isolateModulesAsync(async () => {
         jest.doMock('whatsapp-web.js', () => ({
@@ -405,6 +405,75 @@ describe('WhatsAppService — client replacement (listener leak)', () => {
 
         const result = await svc.sendMessage('123@g.us', 'still connected');
         expect(result).toBe(true);
+    });
+});
+
+describe('WhatsAppService — session-lost alert', () => {
+    /** True if any console.error carried the stable alert token. */
+    function alerted(spy: jest.SpyInstance): boolean {
+        return spy.mock.calls.flat().some(a => typeof a === 'string' && a.includes('wa_session_lost'));
+    }
+
+    it('emits the alert on an involuntary LOGOUT disconnect', async () => {
+        const { state } = await loadFreshService();
+        const spy = jest.spyOn(console, 'error').mockImplementation(() => { });
+        state.handlers['disconnected']?.('LOGOUT');
+        expect(alerted(spy)).toBe(true);
+        spy.mockRestore();
+    });
+
+    it('emits the alert on auth_failure', async () => {
+        const { state } = await loadFreshService();
+        const spy = jest.spyOn(console, 'error').mockImplementation(() => { });
+        state.handlers['auth_failure']?.('session invalidated');
+        expect(alerted(spy)).toBe(true);
+        spy.mockRestore();
+    });
+
+    it('does NOT alert on a non-logout disconnect (e.g. NAVIGATION)', async () => {
+        const { state } = await loadFreshService();
+        const spy = jest.spyOn(console, 'error').mockImplementation(() => { });
+        state.handlers['disconnected']?.('NAVIGATION');
+        expect(alerted(spy)).toBe(false);
+        spy.mockRestore();
+    });
+
+    it('suppresses the alert for an admin-initiated logout()', async () => {
+        const { svc, state } = await loadFreshService();
+        state.handlers['ready']?.();
+        // The real client.logout() emits a LOGOUT `disconnected`; mirror that so the
+        // suppression path (intentionalLogout flag) is exercised end-to-end.
+        state.logout.mockImplementationOnce(async () => {
+            state.handlers['disconnected']?.('LOGOUT');
+        });
+        const spy = jest.spyOn(console, 'error').mockImplementation(() => { });
+        await svc.logout();
+        expect(alerted(spy)).toBe(false);
+        spy.mockRestore();
+    });
+
+    it('alerts again on a later involuntary logout after an intentional one (flag is one-shot)', async () => {
+        const { svc, state } = await loadFreshService();
+        state.handlers['ready']?.();
+        state.logout.mockImplementationOnce(async () => {
+            state.handlers['disconnected']?.('LOGOUT');
+        });
+        await svc.logout(); // consumes the intentional flag
+
+        const spy = jest.spyOn(console, 'error').mockImplementation(() => { });
+        // A fresh, involuntary logout on the new client must alert.
+        state.handlers['disconnected']?.('LOGOUT');
+        expect(alerted(spy)).toBe(true);
+        spy.mockRestore();
+    });
+
+    it('isConnected() reflects the ready state', async () => {
+        const { svc, state } = await loadFreshService();
+        expect(svc.isConnected()).toBe(false);
+        state.handlers['ready']?.();
+        expect(svc.isConnected()).toBe(true);
+        state.handlers['disconnected']?.('LOGOUT');
+        expect(svc.isConnected()).toBe(false);
     });
 });
 
