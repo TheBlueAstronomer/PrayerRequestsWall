@@ -15,6 +15,12 @@ const ACK_SERVER = 1;
 const DEFAULT_ACK_TIMEOUT_MS = 30000;
 const MAX_EARLY_ACKS = 200;
 
+/** How many unscanned QR codes to offer before giving up and releasing Chromium. */
+const QR_MAX_RETRIES = Number(process.env.WA_QR_MAX_RETRIES) || 5;
+
+/** Emitted by whatsapp-web.js as the disconnect reason once qrMaxRetries is hit. */
+const MAX_QR_RETRIES_REASON = 'max qrcode retries';
+
 /** Minimal shape of the Message returned by client.sendMessage(). */
 type SentMessage = { id?: { _serialized?: string }; ack?: number };
 
@@ -52,7 +58,11 @@ class WhatsAppService {
                 dataPath: process.env.WA_DATA_PATH || './.wwebjs_auth',
             }),
             authTimeoutMs: 60000,
-            qrMaxRetries: 0,
+            // Finite on purpose. 0 means *unlimited* in whatsapp-web.js: an
+            // unauthenticated client regenerates a QR every ~20s forever, and each
+            // cycle keeps Chromium resident. Left unbounded this pins the CPU and
+            // fills the disk. Give up instead, and re-arm on demand (see initialize()).
+            qrMaxRetries: QR_MAX_RETRIES,
             puppeteer: {
                 handleSIGINT: false,
                 args: [
@@ -95,6 +105,15 @@ class WhatsAppService {
             this.isReady = false;
             this.isInitializing = false;
             this.settleAllPendingAcks(ACK_PENDING);
+
+            if (String(reason).toLowerCase().includes(MAX_QR_RETRIES_REASON)) {
+                // whatsapp-web.js has destroyed the client and released Chromium.
+                // Drop the expired QR and swap in a fresh, un-initialized client so
+                // the next initialize() starts cleanly rather than reusing a corpse.
+                console.warn(`[WA:qr] No scan after ${QR_MAX_RETRIES} QR codes. Released Chromium; will re-arm on the next initialize().`);
+                this.latestQR = null;
+                this.replaceClient();
+            }
         });
 
         client.on('message_ack', (msg: unknown, ack: number) => {
@@ -144,6 +163,23 @@ class WhatsAppService {
             const timer = setTimeout(() => settle(ACK_PENDING), timeoutMs);
             this.pendingAcks.set(messageId, settle);
         });
+    }
+
+    /**
+     * Swaps in a fresh client, detaching the outgoing one's listeners first.
+     *
+     * Every handler registered in createClient() closes over `this`, so a client
+     * that is replaced without being unsubscribed keeps mutating shared service
+     * state long after it is supposed to be dead. In production that meant a
+     * replaced client carried on emitting 'qr' into this.latestQR alongside its
+     * replacement — two QR codes, milliseconds apart, overwriting each other —
+     * so the QR shown in the admin UI was frequently the dead client's, and
+     * scanning it did nothing. A late 'disconnected' from the old client could
+     * also clear isReady on a perfectly healthy new session.
+     */
+    private replaceClient() {
+        this.client.removeAllListeners();
+        this.client = this.createClient();
     }
 
     /** Releases every in-flight ack wait, e.g. when the client dies mid-send. */
@@ -310,7 +346,7 @@ class WhatsAppService {
         await this.waitForLockRelease();
 
         console.log('[WA:logout] Re-creating client for new session...');
-        this.client = this.createClient();
+        this.replaceClient();
         this.initialize();
         return true;
     }

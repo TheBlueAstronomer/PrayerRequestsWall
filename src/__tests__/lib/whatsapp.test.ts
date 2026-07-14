@@ -16,6 +16,10 @@ interface MockState {
     destroy: jest.Mock;
     logout: jest.Mock;
     sendMessage: jest.Mock;
+    removeAllListeners: jest.Mock;
+    clientOptions: Array<Record<string, unknown>>;
+    /** Every client the module constructed, in order, with its own handler table. */
+    clients: Array<{ handlers: EventHandlers; removeAllListeners: jest.Mock }>;
     pathJoin: jest.Mock;
     fsExists: jest.Mock;
     fsRm: jest.Mock;
@@ -29,6 +33,9 @@ function createMockState(): MockState {
         logout: jest.fn().mockResolvedValue(undefined),
         // Default: WhatsApp acks the message as reaching the server (ACK_SERVER).
         sendMessage: jest.fn().mockResolvedValue({ id: { _serialized: 'msg-default' }, ack: 1 }),
+        removeAllListeners: jest.fn(),
+        clientOptions: [],
+        clients: [],
         pathJoin: jest.fn((...args: string[]) => args.join('/')),
         fsExists: jest.fn().mockReturnValue(false),
         fsRm: jest.fn(),
@@ -51,15 +58,29 @@ async function loadFreshService(applyState?: (s: MockState) => void) {
 
     await jest.isolateModulesAsync(async () => {
         jest.doMock('whatsapp-web.js', () => ({
-            Client: jest.fn().mockImplementation(() => ({
-                on: (event: string, handler: (...args: unknown[]) => void) => {
-                    state.handlers[event] = handler;
-                },
-                initialize: state.initialize,
-                destroy: state.destroy,
-                logout: state.logout,
-                sendMessage: state.sendMessage,
-            })),
+            Client: jest.fn().mockImplementation((options: Record<string, unknown>) => {
+                // Each client keeps its OWN handler table, so a test can prove that a
+                // replaced client no longer holds listeners into the service.
+                const handlers: EventHandlers = {};
+                const instance = {
+                    handlers,
+                    on: (event: string, handler: (...args: unknown[]) => void) => {
+                        handlers[event] = handler;
+                        state.handlers[event] = handler; // latest-wins view, for convenience
+                    },
+                    removeAllListeners: jest.fn(() => {
+                        for (const key of Object.keys(handlers)) delete handlers[key];
+                        state.removeAllListeners();
+                    }),
+                    initialize: state.initialize,
+                    destroy: state.destroy,
+                    logout: state.logout,
+                    sendMessage: state.sendMessage,
+                };
+                state.clientOptions.push(options);
+                state.clients.push(instance);
+                return instance;
+            }),
             LocalAuth: jest.fn().mockReturnValue({}),
         }));
 
@@ -336,6 +357,95 @@ describe('WhatsAppService — logout()', () => {
 
         // After logout a new Client is created and initialize() is called on it
         expect(state.initialize.mock.calls.length).toBeGreaterThan(initCallsBefore);
+    });
+});
+
+describe('WhatsAppService — client replacement (listener leak)', () => {
+    it('detaches the old client listeners when logout() swaps in a new client', async () => {
+        const { svc, state } = await loadFreshService();
+        const oldClient = state.clients[0];
+        expect(oldClient.handlers['qr']).toBeDefined();
+
+        await svc.logout();
+
+        expect(state.clients.length).toBe(2);
+        expect(oldClient.removeAllListeners).toHaveBeenCalled();
+        // The replaced client must hold no listeners into the service.
+        expect(oldClient.handlers['qr']).toBeUndefined();
+        expect(oldClient.handlers['disconnected']).toBeUndefined();
+    });
+
+    it('a replaced client can no longer overwrite latestQR', async () => {
+        // The production bug: the old client stayed subscribed and kept emitting
+        // 'qr' into the shared latestQR alongside its replacement, so the QR shown
+        // in the admin UI was often the dead client's and scanning it did nothing.
+        const { svc, state } = await loadFreshService();
+        const oldClient = state.clients[0];
+
+        await svc.logout();
+        const newClient = state.clients[1];
+
+        newClient.handlers['qr']?.('qr-from-live-client');
+        // The old client is detached: it has no handler left to fire.
+        expect(oldClient.handlers['qr']).toBeUndefined();
+        expect(svc.latestQR).toBe('qr-from-live-client');
+    });
+
+    it('a late disconnect from the replaced client cannot clear a healthy session', async () => {
+        const { svc, state } = await loadFreshService();
+        const oldClient = state.clients[0];
+
+        await svc.logout();
+        const newClient = state.clients[1];
+        newClient.handlers['ready']?.();
+
+        // In production the old client's LOGOUT disconnect landed minutes later and
+        // reset isReady on the new, healthy session. It now has no handler to fire.
+        expect(oldClient.handlers['disconnected']).toBeUndefined();
+
+        const result = await svc.sendMessage('123@g.us', 'still connected');
+        expect(result).toBe(true);
+    });
+});
+
+describe('WhatsAppService — qrMaxRetries', () => {
+    it('bounds QR retries instead of respawning Chromium forever', async () => {
+        const { state } = await loadFreshService();
+        const qrMaxRetries = state.clientOptions[0].qrMaxRetries as number;
+
+        // 0 means "unlimited" in whatsapp-web.js — the infinite-Chromium bug.
+        expect(qrMaxRetries).toBeGreaterThan(0);
+        expect(Number.isFinite(qrMaxRetries)).toBe(true);
+    });
+
+    it('honours WA_QR_MAX_RETRIES', async () => {
+        process.env.WA_QR_MAX_RETRIES = '3';
+        const { state } = await loadFreshService();
+        expect(state.clientOptions[0].qrMaxRetries).toBe(3);
+        delete process.env.WA_QR_MAX_RETRIES;
+    });
+
+    it('drops the expired QR and re-arms a clean client when retries run out', async () => {
+        const { svc, state } = await loadFreshService();
+        const oldClient = state.clients[0];
+        state.handlers['qr']?.('a-qr-nobody-scanned');
+        expect(svc.latestQR).toBe('a-qr-nobody-scanned');
+
+        // whatsapp-web.js destroys the client and emits this once qrMaxRetries is hit.
+        oldClient.handlers['disconnected']?.('Max qrcode retries reached');
+
+        expect(svc.latestQR).toBeNull();
+        expect(oldClient.removeAllListeners).toHaveBeenCalled();
+        expect(state.clients.length).toBe(2);
+    });
+
+    it('does not re-arm the client on an ordinary disconnect', async () => {
+        const { state } = await loadFreshService();
+        const clientsBefore = state.clients.length;
+
+        state.handlers['disconnected']?.('NAVIGATION');
+
+        expect(state.clients.length).toBe(clientsBefore);
     });
 });
 
