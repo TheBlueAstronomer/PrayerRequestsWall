@@ -21,6 +21,15 @@ const QR_MAX_RETRIES = Number(process.env.WA_QR_MAX_RETRIES) || 5;
 /** Emitted by whatsapp-web.js as the disconnect reason once qrMaxRetries is hit. */
 const MAX_QR_RETRIES_REASON = 'max qrcode retries';
 
+/**
+ * Stable event token for the "session lost, a human must re-scan the QR" alert.
+ * A Cloud Logging metric matches this exact string in jsonPayload.message, so it
+ * must not change without updating the metric filter. Emitting a dedicated token
+ * (rather than alerting on an incidental log sentence) is the whole point — the
+ * alert can't silently break because someone reworded a log line.
+ */
+const SESSION_LOST_EVENT = 'wa_session_lost';
+
 /** Minimal shape of the Message returned by client.sendMessage(). */
 type SentMessage = { id?: { _serialized?: string }; ack?: number };
 
@@ -30,6 +39,13 @@ class WhatsAppService {
     public latestQR: string | null = null;
     private isShuttingDown: boolean = false;
     private isInitializing: boolean = false;
+
+    /**
+     * Set while an admin-initiated logout() is in flight, so the LOGOUT
+     * `disconnected` event it causes is recognised as intentional and does NOT
+     * raise the session-lost alert. Consumed (reset) by that event.
+     */
+    private intentionalLogout: boolean = false;
 
     /** Outgoing messages awaiting a server ack, keyed by serialized message id. */
     private pendingAcks: Map<string, (ack: number) => void> = new Map();
@@ -98,6 +114,9 @@ class WhatsAppService {
         client.on('auth_failure', (msg) => {
             console.error(`[WA:auth] Authentication failed: ${msg}`);
             this.isInitializing = false;
+            // Auth failure is always involuntary — the session was rejected and a
+            // human must re-scan. Alert regardless of the intentional-logout flag.
+            this.emitSessionLostAlert(`auth_failure: ${msg}`);
         });
 
         client.on('disconnected', (reason) => {
@@ -105,6 +124,18 @@ class WhatsAppService {
             this.isReady = false;
             this.isInitializing = false;
             this.settleAllPendingAcks(ACK_PENDING);
+
+            const isLogout = String(reason).toUpperCase().includes('LOGOUT');
+            if (isLogout) {
+                if (this.intentionalLogout) {
+                    console.log('[WA:disconnect] Intentional admin logout — alert suppressed.');
+                } else {
+                    // Involuntary logout: the phone unlinked the device, or WhatsApp
+                    // forced it. The bot cannot send until someone re-scans the QR.
+                    this.emitSessionLostAlert(String(reason));
+                }
+                this.intentionalLogout = false; // one-shot; consume it
+            }
 
             if (String(reason).toLowerCase().includes(MAX_QR_RETRIES_REASON)) {
                 // whatsapp-web.js has destroyed the client and released Chromium.
@@ -189,6 +220,20 @@ class WhatsAppService {
         }
         this.pendingAcks.clear();
         this.earlyAcks.clear();
+    }
+
+    /**
+     * Emits the stable, greppable alert line that a Cloud Logging metric watches.
+     * The JSON carries the reason for humans reading the log; the metric only
+     * needs the SESSION_LOST_EVENT token.
+     */
+    private emitSessionLostAlert(reason: string) {
+        console.error(`[WA:alert] ${JSON.stringify({ event: SESSION_LOST_EVENT, reason })}`);
+    }
+
+    /** Whether the client is connected and able to send — the health signal. */
+    public isConnected(): boolean {
+        return this.isReady;
     }
 
     private getLockFilePath(): string {
@@ -318,6 +363,10 @@ class WhatsAppService {
 
     public async logout(): Promise<boolean> {
         console.log(`[WA:logout] Logout requested — isReady: ${this.isReady}`);
+
+        // Mark this as intentional so the LOGOUT `disconnected` event it triggers
+        // does not raise the session-lost alert. The event consumes this flag.
+        this.intentionalLogout = true;
 
         if (this.isReady) {
             try {
