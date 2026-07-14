@@ -3,12 +3,38 @@ import path from 'path';
 
 import { Client, LocalAuth } from 'whatsapp-web.js';
 
+/**
+ * Delivery acknowledgement levels reported by WhatsApp for an outgoing message.
+ * Mirrors whatsapp-web.js's MessageAck enum. Declared locally rather than
+ * imported so the values stay available even when the library is mocked.
+ */
+const ACK_ERROR = -1;
+const ACK_PENDING = 0;
+const ACK_SERVER = 1;
+
+const DEFAULT_ACK_TIMEOUT_MS = 30000;
+const MAX_EARLY_ACKS = 200;
+
+/** Minimal shape of the Message returned by client.sendMessage(). */
+type SentMessage = { id?: { _serialized?: string }; ack?: number };
+
 class WhatsAppService {
     public client: Client;
     private isReady: boolean = false;
     public latestQR: string | null = null;
     private isShuttingDown: boolean = false;
     private isInitializing: boolean = false;
+
+    /** Outgoing messages awaiting a server ack, keyed by serialized message id. */
+    private pendingAcks: Map<string, (ack: number) => void> = new Map();
+
+    /**
+     * Acks that arrived before sendMessage() had registered its waiter. Bounded,
+     * because an unbounded cache on a long-lived singleton is a slow memory leak.
+     */
+    private earlyAcks: Map<string, number> = new Map();
+
+    private ackTimeoutMs: number = Number(process.env.WA_ACK_TIMEOUT_MS) || DEFAULT_ACK_TIMEOUT_MS;
 
     constructor() {
         console.log('[WA:init] Constructing WhatsAppService singleton...');
@@ -68,9 +94,65 @@ class WhatsAppService {
             console.warn(`[WA:disconnect] Client disconnected. Reason: ${reason}. isReady reset to false.`);
             this.isReady = false;
             this.isInitializing = false;
+            this.settleAllPendingAcks(ACK_PENDING);
+        });
+
+        client.on('message_ack', (msg: unknown, ack: number) => {
+            const id = (msg as SentMessage)?.id?._serialized;
+            if (!id) return;
+
+            // Intermediate acks (still queued) are not decisive — keep waiting.
+            if (ack !== ACK_ERROR && ack < ACK_SERVER) return;
+
+            const settle = this.pendingAcks.get(id);
+            if (settle) {
+                settle(ack);
+                return;
+            }
+
+            // The ack beat sendMessage()'s waiter registration — hold it so the
+            // waiter can pick it up instead of timing out on a delivered message.
+            if (this.earlyAcks.size >= MAX_EARLY_ACKS) {
+                const oldest = this.earlyAcks.keys().next().value;
+                if (oldest !== undefined) this.earlyAcks.delete(oldest);
+            }
+            this.earlyAcks.set(id, ack);
         });
 
         return client;
+    }
+
+    /**
+     * Resolves once WhatsApp reports a decisive acknowledgement for the message
+     * (reached the server, or was rejected). Resolves with ACK_PENDING if no
+     * decisive ack arrives before the timeout.
+     */
+    private waitForAck(messageId: string, timeoutMs: number): Promise<number> {
+        const early = this.earlyAcks.get(messageId);
+        if (early !== undefined) {
+            this.earlyAcks.delete(messageId);
+            return Promise.resolve(early);
+        }
+
+        return new Promise((resolve) => {
+            const settle = (ack: number) => {
+                clearTimeout(timer);
+                this.pendingAcks.delete(messageId);
+                resolve(ack);
+            };
+
+            const timer = setTimeout(() => settle(ACK_PENDING), timeoutMs);
+            this.pendingAcks.set(messageId, settle);
+        });
+    }
+
+    /** Releases every in-flight ack wait, e.g. when the client dies mid-send. */
+    private settleAllPendingAcks(ack: number) {
+        for (const settle of [...this.pendingAcks.values()]) {
+            settle(ack);
+        }
+        this.pendingAcks.clear();
+        this.earlyAcks.clear();
     }
 
     private getLockFilePath(): string {
@@ -162,9 +244,36 @@ class WhatsAppService {
         }
 
         try {
-            await this.client.sendMessage(chatId, message);
-            console.log(`[WA:send] Message sent successfully to ${chatId}.`);
-            return true;
+            // sendMessage() resolving only means WhatsApp Web accepted the message
+            // into its outbound queue — not that WhatsApp delivered it. A wrong chat
+            // id, or an account that is no longer in the group, resolves here and is
+            // then dropped server-side. Wait for the ack before reporting success.
+            const sent = await this.client.sendMessage(chatId, message) as SentMessage | undefined;
+
+            if (typeof sent?.ack === 'number' && sent.ack >= ACK_SERVER) {
+                console.log(`[WA:send] Message delivered to ${chatId} (ack: ${sent.ack}).`);
+                return true;
+            }
+
+            const messageId = sent?.id?._serialized;
+            if (!messageId) {
+                console.error(`[WA:send] No message id returned for ${chatId}; cannot confirm delivery.`);
+                return false;
+            }
+
+            const ack = await this.waitForAck(messageId, this.ackTimeoutMs);
+
+            if (ack >= ACK_SERVER) {
+                console.log(`[WA:send] Message delivered to ${chatId} (ack: ${ack}).`);
+                return true;
+            }
+
+            if (ack === ACK_ERROR) {
+                console.error(`[WA:send] WhatsApp rejected the message to ${chatId} (ack: ${ack}). Check the chat id is valid and the account is a participant.`);
+            } else {
+                console.error(`[WA:send] No delivery ack from WhatsApp for ${chatId} within ${this.ackTimeoutMs}ms. Treating as not sent.`);
+            }
+            return false;
         } catch (error) {
             console.error(`[WA:send] Failed to send message to ${chatId}:`, error);
             return false;
@@ -195,6 +304,7 @@ class WhatsAppService {
         this.isReady = false;
         this.latestQR = null;
         this.isInitializing = false;
+        this.settleAllPendingAcks(ACK_PENDING);
 
         console.log('[WA:logout] Waiting for Chromium to release browser lock...');
         await this.waitForLockRelease();
