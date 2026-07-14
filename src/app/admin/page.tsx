@@ -13,6 +13,7 @@ type Prayer = {
 
 export default function AdminPage() {
     const [isAuthenticated, setIsAuthenticated] = useState(false);
+    const [authChecked, setAuthChecked] = useState(false);
     const [password, setPassword] = useState("");
     const [authError, setAuthError] = useState("");
 
@@ -26,6 +27,23 @@ export default function AdminPage() {
     const [isLoggingOut, setIsLoggingOut] = useState(false);
     const [resendingIds, setResendingIds] = useState<Set<number>>(new Set());
     const [testSendingIds, setTestSendingIds] = useState<Set<number>>(new Set());
+
+    // Restore the logged-in view on reload if the session cookie is still valid.
+    useEffect(() => {
+        let cancelled = false;
+        (async () => {
+            try {
+                const res = await fetch("/api/admin/auth");
+                const data = await res.json();
+                if (!cancelled && data.authenticated) setIsAuthenticated(true);
+            } catch {
+                // Treat any failure as "not authenticated" — the login form will show.
+            } finally {
+                if (!cancelled) setAuthChecked(true);
+            }
+        })();
+        return () => { cancelled = true; };
+    }, []);
 
     const fetchSettings = useCallback(async () => {
         try {
@@ -239,6 +257,15 @@ export default function AdminPage() {
             setIsLoggingOut(false);
         }
     };
+
+    // Avoid flashing the login form while the session check is still in flight.
+    if (!isAuthenticated && !authChecked) {
+        return (
+            <main className="flex-1 flex flex-col items-center justify-center px-4 w-full">
+                <p className="text-slate-500">Loading…</p>
+            </main>
+        );
+    }
 
     if (!isAuthenticated) {
         return (
