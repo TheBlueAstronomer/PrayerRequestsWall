@@ -27,7 +27,8 @@ function createMockState(): MockState {
         initialize: jest.fn().mockResolvedValue(undefined),
         destroy: jest.fn().mockResolvedValue(undefined),
         logout: jest.fn().mockResolvedValue(undefined),
-        sendMessage: jest.fn().mockResolvedValue(undefined),
+        // Default: WhatsApp acks the message as reaching the server (ACK_SERVER).
+        sendMessage: jest.fn().mockResolvedValue({ id: { _serialized: 'msg-default' }, ack: 1 }),
         pathJoin: jest.fn((...args: string[]) => args.join('/')),
         fsExists: jest.fn().mockReturnValue(false),
         fsRm: jest.fn(),
@@ -143,6 +144,114 @@ describe('WhatsAppService — sendMessage()', () => {
 
         await svc.sendMessage('123@g.us', 'Test');
         expect(state.initialize.mock.calls.length).toBeGreaterThan(callsBefore);
+    });
+});
+
+describe('WhatsAppService — sendMessage() delivery acknowledgement', () => {
+    /** Lets the awaited client.sendMessage() settle so the ack wait is registered. */
+    const flush = () => new Promise(r => setTimeout(r, 0));
+
+    it('returns true once WhatsApp acks the message as reaching the server', async () => {
+        const { svc, state } = await loadFreshService();
+        state.handlers['ready']?.();
+        // Queued (ack 0) — delivery is only confirmed by the later message_ack event.
+        state.sendMessage.mockResolvedValueOnce({ id: { _serialized: 'm1' }, ack: 0 });
+
+        const pending = svc.sendMessage('123@g.us', 'Hello');
+        await flush();
+        state.handlers['message_ack']?.({ id: { _serialized: 'm1' } }, 1);
+
+        await expect(pending).resolves.toBe(true);
+    });
+
+    it('returns false when WhatsApp rejects the message (ACK_ERROR)', async () => {
+        const { svc, state } = await loadFreshService();
+        state.handlers['ready']?.();
+        state.sendMessage.mockResolvedValueOnce({ id: { _serialized: 'm2' }, ack: 0 });
+
+        const pending = svc.sendMessage('bad@g.us', 'Hello');
+        await flush();
+        state.handlers['message_ack']?.({ id: { _serialized: 'm2' } }, -1);
+
+        await expect(pending).resolves.toBe(false);
+    });
+
+    it('returns false when the message is only queued and never acked (the silent-drop bug)', async () => {
+        process.env.WA_ACK_TIMEOUT_MS = '50';
+        const { svc, state } = await loadFreshService();
+        state.handlers['ready']?.();
+        // Resolves like a normal send, but WhatsApp never acks it — previously
+        // this was reported as "sent successfully".
+        state.sendMessage.mockResolvedValueOnce({ id: { _serialized: 'm3' }, ack: 0 });
+
+        await expect(svc.sendMessage('stale@g.us', 'Hello')).resolves.toBe(false);
+        delete process.env.WA_ACK_TIMEOUT_MS;
+    });
+
+    it('keeps waiting through non-decisive acks before confirming', async () => {
+        const { svc, state } = await loadFreshService();
+        state.handlers['ready']?.();
+        state.sendMessage.mockResolvedValueOnce({ id: { _serialized: 'm4' }, ack: 0 });
+
+        const pending = svc.sendMessage('123@g.us', 'Hello');
+        await flush();
+        // ACK_PENDING must not settle the send...
+        state.handlers['message_ack']?.({ id: { _serialized: 'm4' } }, 0);
+        // ...but ACK_DEVICE must.
+        state.handlers['message_ack']?.({ id: { _serialized: 'm4' } }, 2);
+
+        await expect(pending).resolves.toBe(true);
+    });
+
+    it('ignores acks for unrelated messages', async () => {
+        process.env.WA_ACK_TIMEOUT_MS = '50';
+        const { svc, state } = await loadFreshService();
+        state.handlers['ready']?.();
+        state.sendMessage.mockResolvedValueOnce({ id: { _serialized: 'mine' }, ack: 0 });
+
+        const pending = svc.sendMessage('123@g.us', 'Hello');
+        await flush();
+        state.handlers['message_ack']?.({ id: { _serialized: 'someone-elses' } }, 1);
+
+        await expect(pending).resolves.toBe(false);
+        delete process.env.WA_ACK_TIMEOUT_MS;
+    });
+
+    it('still confirms delivery when the ack arrives before the waiter is registered', async () => {
+        process.env.WA_ACK_TIMEOUT_MS = '50';
+        const { svc, state } = await loadFreshService();
+        state.handlers['ready']?.();
+
+        // Fire the ack from inside client.sendMessage(), i.e. before sendMessage()
+        // has had a chance to register its waiter. A delivered message must not
+        // be reported as a timeout.
+        state.sendMessage.mockImplementationOnce(async () => {
+            state.handlers['message_ack']?.({ id: { _serialized: 'race' } }, 1);
+            return { id: { _serialized: 'race' }, ack: 0 };
+        });
+
+        await expect(svc.sendMessage('123@g.us', 'Hello')).resolves.toBe(true);
+        delete process.env.WA_ACK_TIMEOUT_MS;
+    });
+
+    it('returns false when the client returns no message id to track', async () => {
+        const { svc, state } = await loadFreshService();
+        state.handlers['ready']?.();
+        state.sendMessage.mockResolvedValueOnce(undefined);
+
+        await expect(svc.sendMessage('123@g.us', 'Hello')).resolves.toBe(false);
+    });
+
+    it('stops waiting for an ack if the client disconnects mid-send', async () => {
+        const { svc, state } = await loadFreshService();
+        state.handlers['ready']?.();
+        state.sendMessage.mockResolvedValueOnce({ id: { _serialized: 'm5' }, ack: 0 });
+
+        const pending = svc.sendMessage('123@g.us', 'Hello');
+        await flush();
+        state.handlers['disconnected']?.('LOGOUT');
+
+        await expect(pending).resolves.toBe(false);
     });
 });
 
