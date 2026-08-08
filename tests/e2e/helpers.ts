@@ -43,12 +43,12 @@ export function mockDeletePrayerApi(page: Page, status = 200) {
 }
 
 /** Intercept GET /api/admin/qr */
-export function mockQrApi(page: Page, qr: string | null) {
+export function mockQrApi(page: Page, qr: string | null, connected = true) {
     return page.route('**/api/admin/qr', route =>
         route.fulfill({
             status: 200,
             contentType: 'application/json',
-            body: JSON.stringify({ success: true, qr }),
+            body: JSON.stringify({ success: true, qr, connected }),
         })
     );
 }
@@ -110,11 +110,11 @@ export async function loginAdmin(page: Page, password = 'root') {
 /** Stub all admin data-fetch APIs so the dashboard renders cleanly. */
 export async function stubAdminApis(
     page: Page,
-    opts: { prayers?: object[]; qr?: string | null; groupIds?: string; testGroupId?: string } = {}
+    opts: { prayers?: object[]; qr?: string | null; connected?: boolean; groupIds?: string; testGroupId?: string } = {}
 ) {
-    const { prayers = [], qr = null, groupIds = '', testGroupId = '' } = opts;
+    const { prayers = [], qr = null, connected = true, groupIds = '', testGroupId = '' } = opts;
     await mockAuthApi(page, { success: true, token: 'admin_token_temp' });
     await mockPrayersApi(page, prayers);
-    await mockQrApi(page, qr);
+    await mockQrApi(page, qr, connected);
     await mockSettingsGetApi(page, groupIds, testGroupId);
 }

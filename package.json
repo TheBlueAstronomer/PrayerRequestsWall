@@ -50,6 +50,7 @@
     "jest-environment-jsdom": "^30.3.0",
     "nodemon": "^3.1.11",
     "postcss": "^8.5.6",
+    "puppeteer-core": "24.37.2",
     "tailwindcss": "^4",
     "ts-jest": "^29.4.6",
     "ts-node": "^10.9.2",

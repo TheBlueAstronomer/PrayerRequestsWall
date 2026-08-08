@@ -45,7 +45,7 @@ describe('admin auth middleware', () => {
     });
 
     it('blocks the sensitive endpoints (qr, logout, settings) when unauthenticated', async () => {
-        for (const path of ['/api/admin/qr', '/api/admin/logout', '/api/admin/settings', '/api/admin/prayers/resend']) {
+        for (const path of ['/api/admin/qr', '/api/admin/logout', '/api/admin/settings', '/api/admin/prayers/resend', '/api/admin/whatsapp/reconnect']) {
             const res = await middleware(makeRequest(path));
             expect(res.status).toBe(401);
         }
