@@ -361,6 +361,102 @@ Sending is explicitly **out of scope** and stays stubbed until S3.
 
 ---
 
+## 7a. Progress and revisions (updated 2026-09-30)
+
+| Story | State |
+|---|---|
+| S1 spike | Done. Results in section 7. |
+| S2 connection lifecycle | **Done** — `feat/baileys-migration`, commits `6cf708c`, `67c342b`, `71b9f83`. 243 tests green. |
+| S3 send + delivery | Next. |
+| S4 observability parity | **Folded into S5** — see below. |
+| S5 image slimming | Pending, scope grown. |
+| S6 deploy + pair | Pending. |
+
+### S2 outcome
+
+Ran the full pipeline: planner, coder, tester, reviewer. The tester ran 54 single-change
+mutations and every one turned a test red; it found one genuine defect (a logout racing an
+in-flight `initialize()` leaving an orphaned socket) and left it red rather than patching it.
+The reviewer returned NEEDS WORK with four findings, all since fixed. Two of those findings
+were themselves unpinned by any test, and both are now covered by tests with red controls.
+
+The lead — not the coder stage — wrote the D1 fix and the four review fixes, so that work
+has had less independent review than the rest. Noted here deliberately.
+
+### S4 is folded into S5
+
+S2 turned out to satisfy most of S4 already: the `wa_session_lost` token and its JSON shape
+are byte-identical to master, `intentionalLogout` suppression survives, the health routes
+were never touched, and the connect watchdog is the Baileys equivalent of the old
+`pupBrowser` death-watcher. What remained was a one-line Docker `start_period` reduction,
+which belongs with the S5 compose work, plus a synthetic alert test, which is an operator
+check at S6. Running a four-stage pipeline for one line of YAML would be ceremony.
+
+### Corrections to earlier text in this document
+
+- **Section 7, S2 AC** said "a `close` that is not `DisconnectReason.loggedOut` reconnects
+  automatically". That is not what shipped, and what shipped is better: `440`
+  (`connectionReplaced`) stands down, and a close on an *unpaired* socket stands down
+  quietly rather than reconnecting. Both are reasoned in the spec.
+- **`wa_cleanup_failed` needed no monitoring cleanup.** The review flagged a possible
+  orphaned log-based metric. Verified against the API: the project has exactly **one**
+  log-based metric, `wa_session_lost`, and four alert policies, none referencing
+  `wa_cleanup_failed`. Nothing to delete.
+
+### New constraint: S2 must not reach `master` on its own
+
+`.github/workflows/build.yml` triggers on every push to `master`. It is a **dead AWS/EC2
+deploy path** left over from before the GCE migration — it has failed on all seven of its
+most recent runs — but the real deploy (`cloudbuild.yaml`, the `prayer-wall-main-push`
+trigger) also fires on `master`, and it deploys `docker-compose.prod.yml`, which still
+mounts `wwebjs_auth` and never sets `WA_AUTH_PATH`. Merging S2 alone would therefore ship a
+build that writes credentials to an ephemeral in-container directory and loses the session
+on every restart, while `sendMessage()` still returns `false` unconditionally.
+
+**S3 and S5 land in the same merge as S2.** Nothing in the repo enforces this; it is a
+decision recorded here.
+
+### Scope added to S5
+
+1. **Delete `.github/workflows/build.yml`.** It fails on every push (noise), and if the AWS
+   credentials were ever restored it would deploy this app to a stale EC2 box.
+2. Add `.baileys_auth` to `.gitignore` (only `.wwebjs_auth` is listed).
+3. Reduce the healthcheck `start_period` from 180 s — Baileys connects in seconds.
+4. Include the new auth directory in whatever disk check came out of the 2026-07-14
+   hardening. `useMultiFileAuthState` writes one small JSON file per key and S2 prunes them
+   only on logout or session loss. Not a threat for a send-only bot, but this box has twice
+   died of a full disk and this is a new directory that only grows.
+5. If any dashboard or notification template reads the alert `reason` field, update it:
+   `browser_disconnected` and `auth_failure: <msg>` are replaced by `401`/`403`/`411`,
+   `connection_replaced` and `connect_watchdog`. The `wa_session_lost` token itself is
+   unchanged, so alert policy `4344627323952717444` keeps firing either way.
+
+### Two checks that only the real image can answer (for S5/S6)
+
+- **The dynamic `import()` is unverifiable by the test suite, by construction.** Under
+  `ts-jest`'s CommonJS transform `await import()` compiles to `require()` — which is why the
+  Jest mock intercepts it at all — whereas under `tsx` it must stay a real dynamic import
+  for the fix to work. The two mechanisms are opposites, so the single change that decides
+  whether the server boots is exercised by zero tests. It was verified by hand on Node
+  24.18.0; production is `node:20-bookworm-slim`. **Build the real image and boot it**,
+  confirming both `> Ready on http://` and `[WA:qr] New QR code received` appear, and that
+  `/api/health/whatsapp` answers. Fold this into the R7 npm-scripts check.
+- **QR scannability.** Baileys' QR is a ~277-char URL against `whatsapp-web.js`'s ~239-char
+  token — roughly QR version 14, about 2.7 px per module at the admin page's `size={200}`.
+  It should scan, and the old one did at the same size, but this project has already shipped
+  an unscannable code once. Confirm on a phone at the real size; bump `size` if it fights.
+
+### Known, accepted, not fixed
+
+Post-`open` liveness now depends on Baileys noticing a dead socket rather than on our own
+watcher. Verified that it does: `baileys/lib/Socket/socket.js` ends the socket with
+`DisconnectReason.connectionLost` after `keepAliveIntervalMs + 5000` of silence and emits
+`connection.update` before removing listeners, so with `keepAliveIntervalMs: 30_000` a dead
+open socket surfaces as a transient close within ~35 s. Real, but it is trust moved from our
+code into a release candidate's.
+
+---
+
 ## 8. Rollback
 
 The facade makes this cheap. If Baileys proves unworkable after deployment:
