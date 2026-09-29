@@ -161,7 +161,7 @@ can be simpler.
 | R2 | **Version choice.** npm `latest` is `7.0.0-rc14`, a release candidate; `legacy` is `6.7.24`. Both were published 2026-07-29. | **Resolved 2026-09-30: use `7.0.0-rc14`.** It opened a live socket and issued a QR on the first try, and `fetchLatestBaileysVersion()` reports `isLatest: true`, so it tracks the current protocol. It is also what the `latest` dist-tag points at; `6.7.24` is tagged `legacy`. Being an RC remains a live risk — revisit if pairing or delivery misbehaves. |
 | R3 | **Re-pairing is mandatory.** The `wwebjs_auth` session is meaningless to Baileys. | Accepted and desired; the requested end state is "scan the QR once". The old volume is deliberately left on disk so a rollback can still find it. |
 | R4 | **Alert regression.** The `wa_session_lost` log-based metric matches a literal string. | Story 4 keeps the emitted string identical and verifies with a synthetic log entry, per the established runbook. |
-| R5 | **Ack semantics differ.** Group delivery is reported per participant. | Treat **exact-key `SERVER_ACK`** on `messages.update` as the durable "WhatsApp accepted it" signal for `whatsappSent`. Do not wait on per-participant delivery in a group. |
+| R5 | **Ack semantics differ.** Group delivery is reported per participant. | **This row was WRONG and is corrected — see section 7b.** It said to treat exact-key `SERVER_ACK` on `messages.update` as the acceptance signal. For a **group** that event never carries a status, so implemented literally every send would have reported failure forever: the exact shape of the July bug. The real signal is WhatsApp's own `<ack class="message">` stanza. |
 | R6 | **Baileys is unofficial**; protocol drift and ban risk remain. | Unchanged from today's exposure — `whatsapp-web.js` is equally unofficial. Not a regression. |
 | R7 | **Native dependency in the image.** Baileys 7.x pulls `whatsapp-rust-bridge`. | **Resolved 2026-09-30:** a clean `npm install` pulled 70 packages with 0 vulnerabilities and no Rust toolchain. Note npm 11 defers `preinstall`/`postinstall` scripts (`engine-requirements.js`, protobufjs postinstall); the Docker image runs npm 10 where they execute normally. Confirm in S5 that the image build runs them. |
 | R8 | **Never trust the library's own success signal.** The July bug reported failure while sending nothing, and an earlier analysis wrongly concluded sends were working. | Every delivery claim in this migration must be confirmed on a real phone. |
@@ -287,8 +287,8 @@ Sending is explicitly **out of scope** and stays stubbed until S3.
 
 - `sendMessage(chatId, message)` keeps its exact signature and `Promise<boolean>` return.
 - It sends through `sock.sendMessage(jid, { text })` and captures the returned message key.
-- It resolves `true` only once that exact key reaches `SERVER_ACK` (the value confirmed
-  in S1) through `messages.update`, and `false` on `ERROR` status or timeout.
+- It resolves `true` only once WhatsApp acknowledges that exact message id — see
+  section 7b for which event that actually is — and `false` on a rejection or timeout.
 - The ack wait is bounded by a timeout, and a disconnect mid-send settles all waiters
   rather than leaking them, preserving today's `settleAllPendingAcks` behaviour.
 - Sending while disconnected returns `false` and triggers a bounded re-arm, never a
@@ -454,6 +454,82 @@ watcher. Verified that it does: `baileys/lib/Socket/socket.js` ends the socket w
 `connection.update` before removing listeners, so with `keepAliveIntervalMs: 30_000` a dead
 open socket surfaces as a transient close within ~35 s. Real, but it is trust moved from our
 code into a release candidate's.
+
+---
+
+## 7b. Correction: the acceptance signal for a group send (2026-09-30)
+
+**Section 5 R5 was wrong, and it was wrong in the most expensive possible direction.** It
+instructed S3 to confirm a send by waiting for `messages.update` to report
+`status >= SERVER_ACK` for the message id. Verified against the installed
+`@whiskeysockets/baileys@7.0.0-rc14` source, that event **never carries a status for a
+group**:
+
+`lib/Socket/messages-recv.js:1186` — inside `handleReceipt`:
+
+```js
+if (isJidGroup(remoteJid) || isJidStatusBroadcast(remoteJid)) {
+    if (attrs.participant) { ev.emit('message-receipt.update', ...); }
+} else {
+    ev.emit('messages.update', ids.map(id => ({ key: {...}, update: { status, ... } })));
+}
+```
+
+Group receipts are routed to `message-receipt.update`, per participant. The
+`messages.update`-with-status emit is the `else` branch — **direct chats only**. The single
+exception is `handleBadAck` (`:1558`), which emits `status: ERROR`. So for the prayer
+group's `...@g.us` target, `messages.update` can only ever tell us a send **failed**.
+
+Had this shipped as written, every prayer would have been recorded as unsent while
+messages actually arrived — an outcome almost indistinguishable from the July 2026 bug this
+migration exists to escape, and one that an earlier analysis of that bug already got wrong
+once in the opposite direction.
+
+**The correct signal, for groups and direct chats alike, is WhatsApp's own
+`<ack class="message" id="...">` stanza**, observed on the socket's raw frame emitter as
+`sock.ws.on('CB:ack,class:message')`. This is a supported surface, not a private poke:
+`sock.ws` is a public member of `WASocket`, Baileys dispatches `CB:<tag>,<attr>:<value>`
+for every inbound binary node, and Baileys itself subscribes to this exact event
+(`lib/Socket/messages-recv.js:1624`) and synthesises `{ fromMe: true, id: attrs.id }` from
+it — it only inspects the *failure* case, which is why the success case is ours to observe.
+
+S3 therefore accepts two positive signals, both matched on the exact message id, and two
+negative ones:
+
+| Signal | Source | Fires for | Meaning |
+|---|---|---|---|
+| `CB:ack,class:message`, no `error` attr | `sock.ws` | groups **and** direct | accepted |
+| `messages.update`, `status >= 2` | `sock.ev` | direct only | accepted |
+| `CB:ack,class:message` **with** `error` | `sock.ws` | groups and direct | rejected |
+| `messages.update`, `status === 0` | `sock.ev` | any | rejected |
+
+Everything else — timeout, disconnect, logout, shutdown, a missing message id, a socket
+swapped mid-send — resolves `false`. **Nothing resolves `true` merely because no error was
+thrown.** `sock.sendMessage()` resolving proves only that the stanza reached the TCP
+socket, which is precisely the class of signal R8 forbids trusting.
+
+### A second trap, verified at runtime
+
+`{"ERROR":0,"PENDING":1,"SERVER_ACK":2,"DELIVERY_ACK":3,"READ":4,"PLAYED":5}`
+
+**`ERROR` is `0`, not `-1`.** whatsapp-web.js used `-1`, so the old code could get away
+with truthiness checks. Here `if (!status)` would silently swallow the one value that means
+"WhatsApp rejected this message". Status comparisons must be explicit.
+
+### What remains unverified until the QR is scanned
+
+Baileys only ever inspects the *failure* case of the ack stanza, so its source proves the
+event exists and concerns our outbound messages, but not that WhatsApp emits it on success
+for a group. That cannot be settled without a paired session. S3 implements the server ack
+as the primary accept signal; **S6 confirms it** by looking for
+`[WA:send] Acknowledged id=... (server ack).` in the container log, then the message on a
+physical phone, then `whatsappSent = true` on the row.
+
+If no server ack appears while the phone shows the message, the send worked and only the
+signal is missing. The contingency, in order: add `message-receipt.update` as a third
+accept signal (one listener, matched on `key.id`, any participant); or raise
+`WA_ACK_TIMEOUT_MS` if receipts are merely slow. **Never** fall back to "resolved without
+throwing" — that is the July bug, and acceptance criterion 7 forbids it.
 
 ---
 
