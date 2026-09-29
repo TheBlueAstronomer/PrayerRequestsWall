@@ -149,7 +149,10 @@ class WhatsAppService {
         // react-hooks/rules-of-hooks inside a class.
         // eslint-disable-next-line react-hooks/rules-of-hooks
         const { state, saveCreds } = await useMultiFileAuthState(this.authDir);
-        this.wasRegistered = !!state.creds?.registered;
+        // Local, not `this.wasRegistered`, until we know this socket is the one that
+        // gets installed: a socket we go on to discard must not leave its own
+        // registration state behind on the service (see the first-wins guard below).
+        const registered = !!state.creds?.registered;
 
         const sock = makeWASocket({
             auth: state,
@@ -167,6 +170,27 @@ class WhatsAppService {
             keepAliveIntervalMs: 30_000,
         });
 
+        // First wins. A logout() landing while this call is parked on either await
+        // above re-arms initialize({ force: true }), and that re-arm can finish first
+        // (the auth dir it reads is now empty, so it has less to do). By the time we
+        // reach here, a socket may already be installed.
+        //
+        // Discard ours rather than overwrite it. The incumbent was built against the
+        // auth dir as it exists NOW, post-wipe, so it is the one that can issue the
+        // fresh QR the admin is waiting for; ours still holds the pre-wipe credentials
+        // they just asked us to destroy. Overwriting would report connected as the very
+        // account that was logged out, and strand the incumbent — never ended, every
+        // event it emits dropped by the identity guard in attach().
+        //
+        // graceful: false is deliberate. This socket is being thrown away, not logged
+        // out, and sock.logout() here would unlink the device from the phone.
+        if (this.sock) {
+            console.warn('[WA:init] Another socket was installed while this launch was in flight; discarding this one.');
+            await this.endSocket(sock, false);
+            return;
+        }
+
+        this.wasRegistered = registered;
         this.sock = sock;
         this.attach(sock, saveCreds);
         this.armConnectWatchdog(sock);
