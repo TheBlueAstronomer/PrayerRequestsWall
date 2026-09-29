@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import Link from "next/link";
 import { QRCodeSVG } from 'qrcode.react';
 
@@ -10,6 +10,12 @@ type Prayer = {
     createdAt: string;
     whatsappSent: boolean;
 };
+
+/** A QR is only valid for ~20s, so 15s is plenty while one is on screen. */
+const QR_POLL_SEARCHING_MS = 5000;
+const QR_POLL_QR_SHOWN_MS = 15000;
+/** Connected: no QR can appear without a disconnect first — heartbeat only. */
+const QR_POLL_CONNECTED_MS = 60000;
 
 export default function AdminPage() {
     const [isAuthenticated, setIsAuthenticated] = useState(false);
@@ -27,6 +33,16 @@ export default function AdminPage() {
     const [isLoggingOut, setIsLoggingOut] = useState(false);
     const [resendingIds, setResendingIds] = useState<Set<number>>(new Set());
     const [testSendingIds, setTestSendingIds] = useState<Set<number>>(new Set());
+    // null = not yet known (before the first successful /api/admin/qr fetch, or
+    // after one has failed). Collapsing this into `false` flashed "not connected"
+    // + a Reconnect button on every page load and stuck there permanently if the
+    // fetch ever threw, since the catch below leaves prior state untouched.
+    const [waConnected, setWaConnected] = useState<boolean | null>(null);
+    const [isReconnecting, setIsReconnecting] = useState(false);
+    const [reconnectMsg, setReconnectMsg] = useState("");
+    // Consecutive /api/admin/qr failures. Not state: it drives a threshold, not a
+    // render.
+    const qrFetchFailuresRef = useRef(0);
 
     // Restore the logged-in view on reload if the session cookie is still valid.
     useEffect(() => {
@@ -71,17 +87,50 @@ export default function AdminPage() {
         }
     }, []);
 
+    // A persistently failing/unsuccessful /api/admin/qr must not leave waConnected
+    // stuck at `null` forever — "Checking…" hides the Reconnect button, the one
+    // control that can recover the session. Only flip after a few consecutive
+    // failures so a single blip doesn't flash it. Shared by both the network-error
+    // path (catch) and the parses-but-not-success path (a 401 from src/proxy.ts,
+    // or the route's own 500 body) — neither of those throws, so each needs this
+    // called explicitly rather than falling out of a single catch.
+    const noteQrFetchFailure = useCallback(() => {
+        qrFetchFailuresRef.current += 1;
+        if (qrFetchFailuresRef.current >= 3) {
+            setWaConnected(false);
+            // A stale QR left on screen while fetches are failing is already
+            // expired and unscannable, and its presence takes precedence over
+            // everything else in the render order below — clear it so the
+            // disconnected branch (and its Reconnect/Logout controls) actually
+            // shows instead of a dead code the admin can't act on.
+            setQrCodeData(null);
+        }
+    }, []);
+
     const fetchQrCode = useCallback(async () => {
         try {
             const res = await fetch("/api/admin/qr");
+            if (res.status === 401) {
+                // The session cookie expired or was revoked — src/proxy.ts
+                // rejected the request before the route ever ran. That is not
+                // "WhatsApp is disconnected"; treating it as one would misreport
+                // state behind a wrong diagnosis. Re-show the login form instead.
+                setIsAuthenticated(false);
+                return;
+            }
             const data = await res.json();
             if (data.success) {
+                qrFetchFailuresRef.current = 0;
                 setQrCodeData(data.qr || null);
+                setWaConnected(!!data.connected);
+            } else {
+                noteQrFetchFailure();
             }
         } catch (error) {
             console.error("Failed to fetch QR code", error);
+            noteQrFetchFailure();
         }
-    }, []);
+    }, [noteQrFetchFailure]);
 
     // Initial load logic if authenticated
     useEffect(() => {
@@ -95,13 +144,50 @@ export default function AdminPage() {
             fetchQrCode();
         });
 
-        const qrInterval = setInterval(fetchQrCode, 5000);
-
         return () => {
             cancelAnimationFrame(frame);
-            clearInterval(qrInterval);
         };
     }, [isAuthenticated, fetchPrayers, fetchQrCode, fetchSettings]);
+
+    // Adaptive QR polling. The old fixed 5s interval drove a server-side Chromium
+    // relaunch every tick while the client was failing; the endpoint is read-only
+    // now, but there is still no reason to poll a healthy session hard, and a
+    // hidden tab should not poll at all.
+    useEffect(() => {
+        if (!isAuthenticated) return;
+
+        let cancelled = false;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+
+        const nextDelay = () => {
+            if (waConnected) return QR_POLL_CONNECTED_MS;
+            if (qrCodeData) return QR_POLL_QR_SHOWN_MS;
+            return QR_POLL_SEARCHING_MS;
+        };
+
+        const schedule = () => {
+            timer = setTimeout(async () => {
+                if (cancelled) return;
+                if (document.visibilityState !== "hidden") {
+                    await fetchQrCode();
+                }
+                if (!cancelled) schedule();
+            }, nextDelay());
+        };
+
+        const onVisibilityChange = () => {
+            if (document.visibilityState === "visible" && !cancelled) void fetchQrCode();
+        };
+
+        document.addEventListener("visibilitychange", onVisibilityChange);
+        schedule();
+
+        return () => {
+            cancelled = true;
+            if (timer) clearTimeout(timer);
+            document.removeEventListener("visibilitychange", onVisibilityChange);
+        };
+    }, [isAuthenticated, waConnected, qrCodeData, fetchQrCode]);
 
     const handleLogin = async (e: React.FormEvent) => {
         e.preventDefault();
@@ -249,12 +335,42 @@ export default function AdminPage() {
             const data = await res.json();
             if (!data.success) {
                 alert("Failed to logout: " + (data.error || "Unknown error"));
+            } else {
+                // Without this, the panel keeps saying "WhatsApp is connected."
+                // for up to QR_POLL_CONNECTED_MS (60s) with Logout re-enabled and
+                // inviting a second click — harmless but confusing after a
+                // successful logout that already flipped the real state.
+                await fetchQrCode();
             }
         } catch (error) {
             console.error("Failed to logout", error);
             alert("Failed to logout. Check console for details.");
         } finally {
             setIsLoggingOut(false);
+        }
+    };
+
+    const handleReconnect = async () => {
+        setIsReconnecting(true);
+        setReconnectMsg("");
+        try {
+            const res = await fetch("/api/admin/whatsapp/reconnect", { method: "POST" });
+            if (res.status === 401) {
+                // Same reasoning as fetchQrCode's 401 branch: an expired session
+                // cookie is not "reconnect failed", it's "not logged in any
+                // more" — re-show the login form instead of surfacing the raw
+                // "Unauthorized" body as a reconnect failure message.
+                setIsAuthenticated(false);
+                return;
+            }
+            const data = await res.json();
+            setReconnectMsg(data.success ? (data.message || "Reconnecting…") : (data.error || "Failed to start a reconnect."));
+            if (data.success) await fetchQrCode();
+        } catch (error) {
+            console.error("Failed to reconnect WhatsApp", error);
+            setReconnectMsg("Failed to start a reconnect. Check console for details.");
+        } finally {
+            setIsReconnecting(false);
         }
     };
 
@@ -383,7 +499,12 @@ export default function AdminPage() {
                                 <QRCodeSVG value={qrCodeData} size={200} />
                                 <p className="text-sm text-slate-500 text-center">Scan to connect WhatsApp Bot</p>
                             </div>
-                        ) : (
+                        ) : waConnected === null ? (
+                            <div className="text-center text-slate-500 flex flex-col items-center gap-2">
+                                <span className="material-icons-round text-4xl opacity-50">hourglass_empty</span>
+                                <p className="font-medium text-slate-700 dark:text-slate-300">Checking WhatsApp status…</p>
+                            </div>
+                        ) : waConnected ? (
                             <div className="text-center text-slate-500 flex flex-col items-center gap-4">
                                 <div className="flex flex-col items-center gap-2">
                                     <span className="material-icons-round text-4xl opacity-50 text-green-500">check_circle</span>
@@ -399,6 +520,48 @@ export default function AdminPage() {
                                     <span className="material-icons-round text-sm">logout</span>
                                     {isLoggingOut ? "Logging out..." : "Logout WhatsApp Session"}
                                 </button>
+                            </div>
+                        ) : (
+                            <div className="text-center text-slate-500 flex flex-col items-center gap-4">
+                                <div className="flex flex-col items-center gap-2">
+                                    <span className="material-icons-round text-4xl opacity-50 text-amber-500">link_off</span>
+                                    <p className="font-medium text-slate-700 dark:text-slate-300">WhatsApp is not connected.</p>
+                                    <p className="text-xs">No QR code is on offer. Start a reconnect to get a new one.</p>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                    <button
+                                        onClick={handleReconnect}
+                                        disabled={isReconnecting}
+                                        className="px-4 py-2 bg-primary/10 hover:bg-primary/20 text-primary rounded-lg text-sm font-medium transition-colors border border-primary/30 flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                                    >
+                                        <span className="material-icons-round text-sm">refresh</span>
+                                        {isReconnecting ? "Reconnecting..." : "Reconnect WhatsApp"}
+                                    </button>
+                                    {/*
+                                        A stuck launch (isInitializing latched true with no
+                                        timeout — e.g. a renderer-only OOM-kill under
+                                        mem_limit, which leaves pupBrowser connected so F1's
+                                        watcher never fires) makes the reconnect route return
+                                        "already-connecting" forever, with no UI path out
+                                        otherwise: this render branch is reached exactly
+                                        because waConnected is false, so the Logout button
+                                        that normally lives in the connected branch would
+                                        never be reachable. logout() unconditionally calls
+                                        client.destroy() even when not ready, so it clears the
+                                        wedge regardless of what state the client is actually
+                                        in — the same control this box needed during the
+                                        2026-08-07 outage.
+                                    */}
+                                    <button
+                                        onClick={handleLogout}
+                                        disabled={isLoggingOut}
+                                        className="px-4 py-2 bg-red-50 hover:bg-red-100 text-red-600 dark:bg-red-900/20 dark:hover:bg-red-900/40 dark:text-red-400 rounded-lg text-sm font-medium transition-colors border border-red-200 dark:border-red-800 flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                                    >
+                                        <span className="material-icons-round text-sm">logout</span>
+                                        {isLoggingOut ? "Logging out..." : "Logout"}
+                                    </button>
+                                </div>
+                                {reconnectMsg && <p className="text-xs text-slate-500">{reconnectMsg}</p>}
                             </div>
                         )}
                     </div>

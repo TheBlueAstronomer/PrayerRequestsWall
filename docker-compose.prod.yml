@@ -1,10 +1,31 @@
-version: "3.8"
-
 services:
   app:
     image: asia-south1-docker.pkg.dev/${PROJECT_ID}/prayer-repository/prayer-wall-app:latest
     container_name: prayer-wall-app-prod
     restart: always
+    # tini as PID 1. Chromium runs with --no-zygote and re-parents its helpers;
+    # `npm start` is not an init and never reaps them, so they accumulated at ~2
+    # zombies / 5s during the relaunch loop and ate the PID table — the most likely
+    # reason sshd could not fork a login shell during the 2026-08-07 outage.
+    init: true
+    # Bound the blast radius. With no limit the container can take all 2 GB of RAM
+    # and all 2 GB of swap, and `restart: always` never fires because the process
+    # degrades instead of exiting. memswap_limit == mem_limit means "no swap at all"
+    # for this cgroup in Docker's semantics.
+    #
+    # 1600m, NOT the 1400m first proposed: a healthy single Chromium measures
+    # 0.9-1.4 GB, so 1400m sits inside the healthy band and would OOM-kill good
+    # containers. 1600m clears the healthy peak by ~200 MB and still leaves ~380 MB
+    # for the host, nginx and sshd on the 1.98 GB box. Tighten once A-AC-8 has a
+    # real steady-state number.
+    #
+    # cgroup v1 caveat (verify on the VM, P1): memswap_limit is silently ignored
+    # without the kernel booted with swapaccount=1 — Docker logs "Your kernel does
+    # not support swap limit capabilities" and mem_limit alone still applies.
+    mem_limit: 1600m
+    memswap_limit: 1600m
+    # Kept as-is. Largely moot given Chromium runs with --disable-dev-shm-usage,
+    # but note tmpfs pages count against mem_limit — do not raise this.
     shm_size: '1gb'
     expose:
       - "3000"
@@ -20,6 +41,25 @@ services:
       options:
         gcp-log-cmd: "true"
         gcp-meta-name: "prayer-wall-app-prod"
+    healthcheck:
+      # Observability, not self-healing: Docker does not restart an unhealthy
+      # container by itself. What this buys is a truthful `docker ps` and
+      # `docker inspect -f '{{json .State.Health}}'` when the app is wedged but
+      # still "Up" — precisely the state it sat in for four hours on 2026-08-07,
+      # and the hook a future autoheal sidecar would attach to.
+      #
+      # /api/health, NOT /api/health/whatsapp: the latter 503s whenever WhatsApp is
+      # disconnected, which is a legitimate "needs a QR scan" state, not a sick
+      # container. wget rather than `node -e fetch(...)`: spawning Node every 60s
+      # adds ~45 MB inside the memory cgroup we just capped. 127.0.0.1 is explicit
+      # so the probe can never resolve to ::1 against an IPv4 bind.
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--timeout=5", "--output-document=/dev/null", "http://127.0.0.1:3000/api/health"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      # Generous on purpose: the WhatsApp session takes 60-90s to load and a short
+      # period would flap the container into unhealthy on every boot.
+      start_period: 180s
 
   nginx:
     image: nginx:alpine
