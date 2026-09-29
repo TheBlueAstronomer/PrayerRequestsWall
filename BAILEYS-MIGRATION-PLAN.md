@@ -158,12 +158,12 @@ can be simpler.
 | # | Risk | Handling |
 |---|---|---|
 | R1 | **Baileys may not deliver to the group either.** Sends have been broken since July and the cause could be account-side rather than library-side. | **Story 1 is a throwaway spike** proving delivery to the real group, confirmed on a physical phone, before any refactor begins. If it fails we stop, having spent an hour rather than a week. |
-| R2 | **Version choice.** npm `latest` is `7.0.0-rc14`, a release candidate; `legacy` is `6.7.24`. Both were published 2026-07-29. | Decided by evidence in Story 1 — whichever line actually delivers. Record the answer here. |
+| R2 | **Version choice.** npm `latest` is `7.0.0-rc14`, a release candidate; `legacy` is `6.7.24`. Both were published 2026-07-29. | **Resolved 2026-09-30: use `7.0.0-rc14`.** It opened a live socket and issued a QR on the first try, and `fetchLatestBaileysVersion()` reports `isLatest: true`, so it tracks the current protocol. It is also what the `latest` dist-tag points at; `6.7.24` is tagged `legacy`. Being an RC remains a live risk — revisit if pairing or delivery misbehaves. |
 | R3 | **Re-pairing is mandatory.** The `wwebjs_auth` session is meaningless to Baileys. | Accepted and desired; the requested end state is "scan the QR once". The old volume is deliberately left on disk so a rollback can still find it. |
 | R4 | **Alert regression.** The `wa_session_lost` log-based metric matches a literal string. | Story 4 keeps the emitted string identical and verifies with a synthetic log entry, per the established runbook. |
 | R5 | **Ack semantics differ.** Group delivery is reported per participant. | Treat **exact-key `SERVER_ACK`** on `messages.update` as the durable "WhatsApp accepted it" signal for `whatsappSent`. Do not wait on per-participant delivery in a group. |
 | R6 | **Baileys is unofficial**; protocol drift and ban risk remain. | Unchanged from today's exposure — `whatsapp-web.js` is equally unofficial. Not a regression. |
-| R7 | **Native dependency in the image.** Baileys 7.x pulls `whatsapp-rust-bridge`. | Verified as Rust compiled to **WebAssembly**, with no `os`/`cpu` constraints, so `npm ci` should need no Rust toolchain. Re-confirm in Story 1. |
+| R7 | **Native dependency in the image.** Baileys 7.x pulls `whatsapp-rust-bridge`. | **Resolved 2026-09-30:** a clean `npm install` pulled 70 packages with 0 vulnerabilities and no Rust toolchain. Note npm 11 defers `preinstall`/`postinstall` scripts (`engine-requirements.js`, protobufjs postinstall); the Docker image runs npm 10 where they execute normally. Confirm in S5 that the image build runs them. |
 | R8 | **Never trust the library's own success signal.** The July bug reported failure while sending nothing, and an earlier analysis wrongly concluded sends were working. | Every delivery claim in this migration must be confirmed on a real phone. |
 
 ---
@@ -212,6 +212,39 @@ neither suited to an autonomous coding pipeline.
 
 **Done when:** a human has seen the message on their phone, and the chosen version is
 written into this file.
+
+---
+
+### S1 results (recorded 2026-09-30)
+
+The non-pairing half of this spike ran and passed. The delivery half is deferred to S6
+so that the single QR scan happens on the deployed app, as requested, rather than
+burning a linked-device slot on a throwaway script.
+
+| Check | Result |
+|---|---|
+| Install without a Rust toolchain | Pass — 70 packages, 0 vulnerabilities |
+| `makeWASocket`, `DisconnectReason`, `useMultiFileAuthState` exported | Pass |
+| WhatsApp Web version negotiated | `[2,3000,1043857760]`, `isLatest: true` |
+| Live socket to WhatsApp | Pass |
+| QR issued | Pass — 277 chars, `https://wa.me/settings/linked_de...` |
+| RSS after import | 80.5 MB |
+| **Peak RSS with an open socket** | **102.4 MB** (vs ~1.4 GB for Chromium, ~14x less) |
+
+Two findings that affect implementation:
+
+1. **Baileys 7 requires an explicit `logger`.** Passing `undefined` throws
+   `TypeError: Cannot read properties of undefined (reading 'child')` inside
+   `makeNoiseHandler`. Pass a real `pino` instance; use level `silent` so Baileys'
+   very chatty debug output never reaches the container log (which ships to Cloud
+   Logging and is billed).
+2. **The QR payload is now a URL**, not the opaque token `whatsapp-web.js` produced.
+   `qrcode.react` renders any string, so the admin page needs no change — but any test
+   asserting on QR shape must not assume the old format.
+
+**Carried into S3 as an open question:** the spike never paired, so the exact
+`messages.update` status value for durable acceptance is still unverified against a
+real group. S3 must treat this as its one open question and confirm it at S6.
 
 ---
 
