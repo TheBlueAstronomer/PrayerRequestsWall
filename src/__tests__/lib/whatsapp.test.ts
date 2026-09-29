@@ -95,7 +95,7 @@ interface MockState {
     /** One entry is consumed per useMultiFileAuthState() call: an Error rejects, a Deferred parks the call. */
     authPlan: Array<Error | Deferred>;
     /** One entry is consumed per makeWASocket() call: an Error is thrown. */
-    makePlan: Error[];
+    makePlan: (Error | null)[];
     evOnThrows: boolean;
     /** In-memory stand-in for the auth directory's contents. creds.json present means "registered". */
     authFiles: Set<string>;
@@ -118,7 +118,7 @@ interface LoadOptions {
     /** Default true: a box restarting with a populated auth dir is the production norm. */
     registered?: boolean;
     authPlan?: Array<Error | Deferred>;
-    makePlan?: Error[];
+    makePlan?: (Error | null)[];
     evOnThrows?: boolean;
     env?: Record<string, string>;
     lifecycle?: string;
@@ -1064,8 +1064,24 @@ describe('spec 3.5: logout', () => {
         expect(svc.getStatus().hasQr).toBe(false);
     });
 
-    it('3.5 a logout while merely connecting cannot unlink (never open), so it end()s the socket instead', async () => {
+    it('3.5 a logout while connecting still unlinks when the socket holds valid creds', async () => {
+        // graceful is `isReady || wasRegistered`, not `isReady` alone. A socket built from
+        // real credentials already has an entry in the phone's Linked Devices even before it
+        // reaches 'open'; end()ing it would wipe our copy and strand that entry, burning a
+        // companion slot with a zombie the admin cannot tell from a live one. The trigger is
+        // ordinary: clicking Logout while a reconnect is in flight.
         const { svc, state } = await loadPaired();
+
+        await svc.logout();
+
+        expect(state.sockets[0].logout).toHaveBeenCalled();
+        expect(state.sockets[0].end).not.toHaveBeenCalled();
+    });
+
+    it('3.5 a logout with no credentials to unlink just end()s the socket', async () => {
+        // The other half of `isReady || wasRegistered`: an unpaired socket has no device
+        // entry to remove, so sock.logout() would be a pointless round trip.
+        const { svc, state } = await loadUnpaired();
 
         await svc.logout();
 
@@ -1206,6 +1222,12 @@ describe('spec 3.5: logout', () => {
         expect(alertReasons()).toEqual([]);
         expect(svc.getStatus().initializing).toBe(false);
         expect(svc.isConnected()).toBe(false);
+        // The owned socket is UNREGISTERED, so its close must take the quiet
+        // unpaired stand-down: no rung burnt, no reconnect armed. Without these two the
+        // transient branch satisfies the three assertions above just as well, and the
+        // wasRegistered relocation in openSocket() would be unpinned (review F5).
+        expect(svc.getStatus().consecutiveInitFailures).toBe(0);
+        expect(jest.getTimerCount()).toBe(0);
     });
 
     it('3.5 trigger B: after the race settles, no socket is left running with nothing owning it', async () => {
@@ -1258,6 +1280,39 @@ describe('spec 3.5: logout', () => {
         emitLate(state, 0, 'connection.update', { qr: 'post-wipe-qr' });
         expect(svc.latestQR).toBe('post-wipe-qr');
         expect(svc.isConnected()).toBe(false);
+    });
+
+    it('3.5 trigger B: a pre-wipe socket is discarded even when it reaches the guard first (auth epoch)', async () => {
+        // The ordering the review identified as the dangerous one, and the reason the guard
+        // cannot rely on who finishes first. Here the in-flight launch — the one holding the
+        // credentials logout is about to delete — reaches the install point BEFORE logout's
+        // re-arm does, with this.sock still null, so a purely order-based "first wins" would
+        // install it. It would then reach 'open', report isConnected() as the very account
+        // the admin just logged out, never show a QR, and its own saveCreds would rewrite the
+        // credentials that were just deleted. The epoch makes the decision causal.
+        const inflight = deferred();
+        const rearm = deferred();
+        const { svc, state } = await loadPaired({ authPlan: [inflight, rearm] });
+
+        await svc.logout(); // wipes the creds (bumping the epoch) and starts the re-arm
+        await flush();
+
+        inflight.resolve(); // the PRE-wipe launch gets to the guard first
+        await flush();
+
+        expect(state.authStates[0].creds.registered).toBe(true); // it was built pre-wipe
+        expect(state.sockets[0].end).toHaveBeenCalledWith(undefined); // discarded regardless
+        expect(state.sockets[0].logout).not.toHaveBeenCalled(); // discarded, not unlinked
+        expect(ownedSockets(svc, state)).toEqual([]); // nothing installed yet
+        expect(svc.isConnected()).toBe(false);
+
+        rearm.resolve(); // now the post-wipe launch installs
+        await flush();
+
+        expect(state.authStates[1].creds.registered).toBe(false);
+        expect(ownedSockets(svc, state)).toEqual([1]);
+        emitLate(state, 1, 'connection.update', { qr: 'fresh-qr' });
+        expect(svc.latestQR).toBe('fresh-qr');
     });
 
     it('3.5 trigger C: the loggedOut close from sock.logout() landing AFTER logout() finished is dropped', async () => {
@@ -1449,7 +1504,15 @@ describe('spec 3.7: restart with corrupt or partial creds', () => {
             expect.stringContaining('Socket initialization failed'),
             fatal,
         );
-        expect(jest.getTimerCount()).toBe(0); // nothing leaked, nothing scheduled
+        // One timer: the retry the failure armed. Even a genuinely fatal cause (a file
+        // where the auth directory should be) must keep retrying — the ladder tops out at
+        // 15 min repeating, and those log lines are the only signal anyone gets that
+        // WhatsApp is down. The alternative is an indefinite outage nothing recovers from.
+        expect(jest.getTimerCount()).toBe(1);
+
+        state.authPlan.length = 0; // let the retry succeed
+        await advance(LADDER_MS[0]);
+        expect(state.makeWASocket).toHaveBeenCalledTimes(1);
     });
 });
 
@@ -1486,7 +1549,7 @@ describe('failure handling in initialize()', () => {
         expect(svc.getStatus().consecutiveInitFailures).toBe(1);
         expect(svc.getStatus().initializing).toBe(false);
         expect(svc.isConnected()).toBe(false);
-        expect(jest.getTimerCount()).toBe(0);
+        expect(jest.getTimerCount()).toBe(1); // the retry armed by the failure
 
         await svc.initialize({ force: true });
         await flush();
@@ -1501,7 +1564,36 @@ describe('failure handling in initialize()', () => {
         expect(svc.getStatus().initializing).toBe(false);
         expect(svc.getStatus().consecutiveInitFailures).toBe(1);
         expect(svc.isConnected()).toBe(false);
-        expect(jest.getTimerCount()).toBe(0);
+        expect(jest.getTimerCount()).toBe(1); // the retry armed by the failure
+    });
+
+    it('a launch that throws before installing must not tear down the socket another launch installed', async () => {
+        // Review F4. Every throw site in openSocket() is before `this.sock = sock`, so at
+        // the moment initialize()'s catch runs, this.sock — if set at all — belongs to a
+        // DIFFERENT launch. Calling teardownSocket() there would destroy a healthy socket
+        // because an unrelated, already-doomed launch failed, and (with no retry armed for
+        // the victim) leave WhatsApp down until an admin clicks Reconnect. openSocket() now
+        // cleans up only a socket it installed itself.
+        const gate = deferred();
+        const { svc, state } = await loadPaired({
+            authPlan: [gate],
+            makePlan: [null, new Error('makeNoiseHandler exploded')],
+        });
+
+        // logout() clears the latch while the bootstrap launch is parked, so its re-arm
+        // installs a socket of its own.
+        await svc.logout();
+        await flush();
+        expect(ownedSockets(svc, state)).toEqual([0]);
+
+        gate.resolve(); // the parked launch resumes and throws at makeWASocket
+        await flush();
+
+        // The failure is recorded against the service, but the healthy socket survives.
+        expect(svc.getStatus().consecutiveInitFailures).toBe(1);
+        expect(ownedSockets(svc, state)).toEqual([0]);
+        expect(state.sockets[0].end).not.toHaveBeenCalled();
+        expect(state.sockets[0].logout).not.toHaveBeenCalled();
     });
 
     it('a failed init does not raise the session-lost alert (nothing was lost)', async () => {

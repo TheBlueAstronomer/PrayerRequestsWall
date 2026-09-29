@@ -95,6 +95,16 @@ class WhatsAppService {
      * it causes is recognised as intentional and does NOT raise the session-lost
      * alert. Consumed (reset) by logout() after the socket is detached.
      */
+    /**
+     * Bumped every time the credentials on disk are invalidated (see clearAuthDir()).
+     * openSocket() samples it before its awaits and re-checks after: a socket built
+     * from credentials that were wiped while it was being built is discarded rather
+     * than installed, no matter which concurrent launch happens to finish first.
+     * Without this the outcome depends on await-resolution order, and the losing
+     * ordering silently reconnects as the account the admin just logged out.
+     */
+    private authEpoch: number = 0;
+
     private intentionalLogout: boolean = false;
 
     /** At most one scheduled auto-reconnect is ever armed. This is the storm guard. */
@@ -136,6 +146,9 @@ class WhatsAppService {
      * real init failures and are caught by initialize(), not here.
      */
     private async openSocket(): Promise<void> {
+        // Sampled before any await. Compared again at the install guard below.
+        const epoch = this.authEpoch;
+
         // Dynamic import, NOT a top-level import. Baileys 7 is ESM-only, and one of its
         // own dependencies (whatsapp-rust-bridge) exports only an "import" condition.
         // Production starts under `tsx server.ts`, which compiles this file to CJS, so a
@@ -184,16 +197,41 @@ class WhatsAppService {
         //
         // graceful: false is deliberate. This socket is being thrown away, not logged
         // out, and sock.logout() here would unlink the device from the phone.
-        if (this.sock) {
-            console.warn('[WA:init] Another socket was installed while this launch was in flight; discarding this one.');
+        // Two independent reasons to throw this socket away rather than install it.
+        //
+        // `this.sock` — another launch got there first. Only reachable via logout(),
+        // which is the one thing that clears isInitializing while a launch is parked.
+        //
+        // `epoch !== this.authEpoch` — the credentials this socket was built from were
+        // wiped while it was being built. This is the load-bearing half: without it the
+        // winner is decided by await-resolution order, and in the ordering where the
+        // in-flight launch reads creds.json just before logout() deletes it, the socket
+        // that wins carries the credentials the admin asked us to destroy. It would
+        // reach 'open', report isConnected() as that account, never show a QR, and its
+        // own saveCreds would rewrite the deleted credentials.
+        //
+        // graceful: false is deliberate. This socket is being thrown away, not logged
+        // out, and sock.logout() here would unlink the device from the phone.
+        if (this.sock || epoch !== this.authEpoch) {
+            const why = this.sock ? 'another socket was installed first' : 'its credentials were wiped mid-launch';
+            console.warn(`[WA:init] Discarding a socket that was built but not installed: ${why}.`);
             await this.endSocket(sock, false);
             return;
         }
 
         this.wasRegistered = registered;
         this.sock = sock;
-        this.attach(sock, saveCreds);
-        this.armConnectWatchdog(sock);
+        try {
+            this.attach(sock, saveCreds);
+            this.armConnectWatchdog(sock);
+        } catch (err) {
+            // Installed but not fully wired. We own it, so we release it here rather
+            // than leaving that to initialize()'s catch — which must not touch
+            // this.sock, because on every other throw path the socket it points at
+            // belongs to somebody else (F4).
+            this.teardownSocket();
+            throw err;
+        }
     }
 
     /**
@@ -492,6 +530,11 @@ class WhatsAppService {
      * the socket is already gone.
      */
     private clearAuthDir(): void {
+        // Bump first and unconditionally, before the early return. The epoch records
+        // the INTENT to invalidate; any socket already being built from the old
+        // credentials must be discarded even if there turned out to be nothing on
+        // disk to delete.
+        this.authEpoch += 1;
         try {
             if (!fs.existsSync(this.authDir)) return;
             for (const entry of fs.readdirSync(this.authDir)) {
@@ -563,8 +606,19 @@ class WhatsAppService {
                 `[WA:init] Socket initialization failed (consecutive failure ${this.consecutiveInitFailures}; next attempt allowed in ${backoffMs}ms):`,
                 err,
             );
-            this.teardownSocket();
+            // Deliberately NOT teardownSocket(): every throw site in openSocket() is
+            // either before the socket is installed — in which case this.sock belongs
+            // to another launch and must not be destroyed — or already cleaned up by
+            // openSocket()'s own catch.
             this.isInitializing = false;
+            // A failed init must retry. Master self-healed by accident, because
+            // sendMessage() re-armed initialize() whenever it was called while
+            // disconnected; the S2 stub does not, so without this the only thing that
+            // could ever recover a failed boot is an admin clicking Reconnect — an
+            // indefinite outage that raises no wa_session_lost alert. The ladder tops
+            // out at 15 min repeating, so even a genuinely fatal cause costs four log
+            // lines an hour, which is the only signal anyone gets.
+            this.scheduleReconnect(backoffMs);
         }
     }
 
@@ -651,7 +705,15 @@ class WhatsAppService {
             // are handled: if the close lands first, intentionalLogout is still true
             // and the alert is suppressed; if it lands after the detach below, the
             // identity guard drops it.
-            await this.endSocket(sock, this.isReady);
+            // isReady OR wasRegistered: a socket holding valid credentials that has not
+            // yet reached 'open' still has a live entry in the phone's Linked Devices.
+            // end()ing it wipes our copy and leaves that entry stranded, burning one of
+            // WhatsApp's few companion slots with a zombie the admin cannot tell from a
+            // live one — and the trigger is ordinary, clicking Logout while a reconnect
+            // is in flight. sock.logout() may fail on a not-yet-authenticated socket;
+            // endSocket() is bounded and never throws, so the cost of trying is one log
+            // line and the benefit is that the common case actually unlinks.
+            await this.endSocket(sock, this.isReady || this.wasRegistered);
         }
 
         this.sock = null;
