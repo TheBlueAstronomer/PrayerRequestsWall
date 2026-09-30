@@ -21,6 +21,33 @@
  *   3.11  close from a superseded socket ....... describe 'spec 3.11'
  *   3.12  shutdown mid-connect ................. describe 'spec 3.12'
  *
+ * S3 spec coverage (section numbers refer to s3-spec.md; describe titles are 'spec 3.N: ...'):
+ *   3.1   send while disconnected .............. describe 'spec 3.1: send while disconnected'
+ *   3.2   send while connecting ................ describe 'spec 3.2: send while connecting'
+ *   3.3   ack before the key (early-ack race) .. describe 'spec 3.3: the ack arrives before the key'
+ *   3.4   ack never arrives .................... describe 'spec 3.4: the ack never arrives'
+ *   3.5   ERROR status is 0, not "absent" ..... describe 'spec 3.5: an ERROR outcome'
+ *   3.6   disconnect mid-send .................. describe 'spec 3.6: disconnect mid-send'
+ *   3.7   logout mid-send ...................... describe 'spec 3.7: logout mid-send'
+ *   3.8   shutdown mid-send .................... describe 'spec 3.8: shutdown mid-send'
+ *   3.9   two concurrent sends ................. describe 'spec 3.9: two concurrent sends'
+ *   3.10  the same id acked twice .............. describe 'spec 3.10: the same id acked twice'
+ *   3.11  events about messages we never sent .. describe 'spec 3.11: events about messages we never sent'
+ *   3.12  group vs direct jid .................. describe 'spec 3.12: group and direct chats'
+ *   3.13  listener hygiene, identity guard ..... describe 'spec 3.13: listener hygiene and the identity guard'
+ *   3.14  no usable message key ................ describe 'spec 3.14: no usable message key'
+ *   3.15  relay rejects / relay deadline ....... describe 'spec 3.15: sock.sendMessage() rejects, and the relay deadline'
+ *   3.16  env overrides and content shape ...... describe 'spec 3.16: env overrides and content shape'
+ *   facade  sendMessage() arity/Promise/boolean  describe 'frozen facade: sendMessage()'
+ *
+ * The S3 group-ack finding the whole story turns on (s3-spec.md section 0): for a group jid Baileys
+ * never emits a positive `messages.update`, so a send is confirmed by the server's raw
+ * `CB:ack,class:message` frame on `sock.ws` alone. Spec 3.12's first test fires no `messages.update`
+ * at all; do not "helpfully" add one.
+ *
+ * Three tests are deliberately white-box (they plant a waiter in the private `pendingSends` map or
+ * call the private `teardownSocket()`): the unconditional settle in logout() and shutdown, and the
+ * teardownSocket() wiring, guard states the public API cannot construct. Each says so in place.
  * Deliberately NOT asserted anywhere: the shape or length of a QR payload. Baileys' QR is a
  * URL today and its format is not a contract (spec 3.2). Tests only round-trip an opaque
  * string they invented.
@@ -44,6 +71,20 @@ const LADDER_MS = [5_000, 15_000, 60_000, 300_000, 900_000];
 const DEFAULT_AUTH_DIR = '/app/.baileys_auth';
 /** Raw-frame event carrying the server's ack of one of our outbound messages (S3). */
 const WA_ACK_EVENT = 'CB:ack,class:message';
+/** How long a send waits for a decisive ack once it has a message id (WA_ACK_TIMEOUT_MS default). */
+const ACK_TIMEOUT_MS = 20_000;
+/** Ceiling on sock.sendMessage() itself (WA_SEND_RELAY_TIMEOUT_MS default). */
+const RELAY_TIMEOUT_MS = 10_000;
+/** FIFO bound on outcomes that beat their waiter. */
+const MAX_EARLY_ACKS = 200;
+/** Backstop on concurrent ack waiters. */
+const MAX_PENDING_SENDS = 100;
+/** Floor between two send-triggered re-arms. */
+const SEND_REARM_MIN_INTERVAL_MS = 60_000;
+/** A WhatsApp group jid, the production target. */
+const GROUP = '120363000000000000@g.us';
+/** A direct chat jid, the resend route's `test` target. */
+const DIRECT = '27821234567@s.whatsapp.net';
 
 // --- Mock plumbing ---
 
@@ -266,6 +307,9 @@ async function loadService(opts: LoadOptions = {}): Promise<{ svc: Svc; state: M
     delete process.env.WA_AUTH_PATH;
     delete process.env.WA_DATA_PATH;
     delete process.env.WA_LOG_LEVEL;
+    // Read once at construction, so a stale value from an earlier test would silently retime every send.
+    delete process.env.WA_ACK_TIMEOUT_MS;
+    delete process.env.WA_SEND_RELAY_TIMEOUT_MS;
     for (const [key, value] of Object.entries(opts.env ?? {})) process.env[key] = value;
     if (opts.lifecycle) process.env.npm_lifecycle_event = opts.lifecycle;
 
@@ -377,6 +421,125 @@ function closeWith(statusCode?: number, message = 'Connection Closed') {
     return { connection: 'close', lastDisconnect: { error, date: new Date() } };
 }
 
+// --- S3 send helpers ---
+
+/** The WAMessage `sock.sendMessage()` resolves with: the id lives at key.id (a string). */
+const sentKey = (id: string, jid: string = GROUP) => ({ key: { id, remoteJid: jid, fromMe: true } });
+
+/** A paired session that has reached 'open', with `sock.sendMessage()` resolving id MSGID1. */
+async function loadOpen(opts: LoadOptions = {}) {
+    const loaded = await loadPaired(opts);
+    conn(loaded.state, 0, { connection: 'open' });
+    loaded.state.sockSend.mockResolvedValue(sentKey('MSGID1'));
+    return loaded;
+}
+
+/** A promise's settlement, observable without awaiting it: `done` flips the moment it settles. */
+interface Tracked<T> {
+    promise: Promise<T>;
+    done: boolean;
+    value: T | undefined;
+    error: unknown;
+}
+
+function track<T>(promise: Promise<T>): Tracked<T> {
+    const t: Tracked<T> = { promise, done: false, value: undefined, error: undefined };
+    promise.then(
+        (v) => {
+            t.done = true;
+            t.value = v;
+        },
+        (e: unknown) => {
+            t.done = true;
+            t.error = e;
+        },
+    );
+    return t;
+}
+
+interface ParkedSend {
+    /** Settles the parked sock.sendMessage() with the WAMessage it was parked with. */
+    release: () => void;
+    /** Rejects it instead. */
+    fail: (err: Error) => void;
+}
+
+/**
+ * Parks the NEXT sock.sendMessage() call on a gate: the relay stays in flight until the test
+ * releases it. sock.sendMessage() is async, so failures are rejections, never sync throws.
+ */
+function parkSend(state: MockState, result: unknown): ParkedSend {
+    let release!: () => void;
+    let fail!: (err: Error) => void;
+    const gate = new Promise<unknown>((resolve, reject) => {
+        release = () => resolve(result);
+        fail = reject;
+    });
+    state.sockSend.mockReturnValueOnce(gate);
+    return { release, fail };
+}
+
+/** Baileys' failure when the ws is not open: a Boom 'Connection Closed' carrying 428. */
+const connectionClosedBoom = () =>
+    Object.assign(new Error('Connection Closed'), { isBoom: true, output: { statusCode: 428 } });
+
+/** Every `[WA:send]` line a console spy has captured (first argument only). */
+const sendLines = (spy: jest.SpiedFunction<typeof console.log>): string[] =>
+    spy.mock.calls.map((call) => String(call[0])).filter((line) => line.includes('[WA:send]'));
+
+/** `[WA:send]` lines across log, warn and error: a change in this total means the service said something. */
+const totalSendLines = (): number =>
+    sendLines(logSpy).length + sendLines(warnSpy).length + sendLines(errorSpy).length;
+
+/** How many captured calls (any first argument) contain `needle`. */
+const countLogged = (spy: jest.SpiedFunction<typeof console.log>, needle: string): number =>
+    spy.mock.calls.filter((call) => String(call[0]).includes(needle)).length;
+
+/**
+ * Proves the service holds neither a stale buffered outcome nor a leaked in-flight count: an ack
+ * for an id nobody is waiting on must be DROPPED, so a later send that happens to carry that id
+ * times out instead of being "confirmed" by an ack that predates it.
+ */
+async function expectStrayAckIsDropped(svc: Svc, state: MockState, index = 0) {
+    serverAck(state, index, { id: 'GHOST' });
+    state.sockSend.mockResolvedValueOnce(sentKey('GHOST'));
+    const send = track(svc.sendMessage(GROUP, 'ghost check'));
+    await flush();
+    expect(send.done).toBe(false);
+    await advance(ACK_TIMEOUT_MS);
+    expect(send.value).toBe(false);
+}
+
+/** The private state a white-box test has to reach; see the tests that use it for why. */
+interface ServiceInternals {
+    pendingSends: Map<string, (outcome: string) => void>;
+    teardownSocket: () => void;
+}
+const internals = (svc: Svc) => svc as unknown as ServiceInternals;
+
+/**
+ * Runs `body` with setTimeout wrapped so every timer handle's unref() is observable. Jest's fake
+ * timers cannot say whether the service unref'd a timer; this can. Always restores setTimeout.
+ */
+async function withUnrefTracking(body: (seen: Array<{ ms: number; unref: jest.Mock }>) => Promise<void>) {
+    const g = globalThis as unknown as { setTimeout: (...args: unknown[]) => unknown };
+    const original = g.setTimeout;
+    const seen: Array<{ ms: number; unref: jest.Mock }> = [];
+    g.setTimeout = ((fn: unknown, ms?: number, ...rest: unknown[]) => {
+        const handle = original(fn, ms, ...rest) as { unref?: () => unknown };
+        const realUnref = handle.unref?.bind(handle);
+        const unref = jest.fn(() => realUnref?.());
+        handle.unref = unref;
+        seen.push({ ms: ms ?? 0, unref });
+        return handle;
+    }) as never;
+    try {
+        await body(seen);
+    } finally {
+        g.setTimeout = original;
+    }
+}
+
 // --- Console capture ---
 
 let logSpy: jest.SpiedFunction<typeof console.log>;
@@ -415,7 +578,14 @@ const IDLE_STATUS: WhatsAppStatus = {
     nextInitAllowedAt: 0,
 };
 
-const ENV_KEYS = ['WA_AUTH_PATH', 'WA_DATA_PATH', 'WA_LOG_LEVEL', 'npm_lifecycle_event'];
+const ENV_KEYS = [
+    'WA_AUTH_PATH',
+    'WA_DATA_PATH',
+    'WA_LOG_LEVEL',
+    'WA_ACK_TIMEOUT_MS',
+    'WA_SEND_RELAY_TIMEOUT_MS',
+    'npm_lifecycle_event',
+];
 const savedEnv: Record<string, string | undefined> = {};
 
 beforeEach(() => {
@@ -2058,5 +2228,1819 @@ describe('spec 3.12: shutdown', () => {
         await flush();
 
         expect(state.makeWASocket).toHaveBeenCalledTimes(1);
+    });
+});
+
+// =============================================================================================
+// S3 - sending and delivery confirmation (section numbers refer to s3-spec.md)
+// =============================================================================================
+
+// ---------------------------------------------------------------------------------------------
+// Spec 3.1 - send while disconnected
+// ---------------------------------------------------------------------------------------------
+
+describe('spec 3.1: send while disconnected', () => {
+    it('3.1 no socket: resolves false, never touches sock.sendMessage, and requests exactly one re-init', async () => {
+        const { svc, state } = await loadPaired();
+        conn(state, 0, closeWith(401)); // stand-down: no socket, no reconnect timer, no backoff window
+        expect(state.makeWASocket).toHaveBeenCalledTimes(1);
+        const before = svc.getStatus();
+
+        const result = await svc.sendMessage(GROUP, 'hello');
+        await flush();
+
+        expect(result).toBe(false);
+        expect(state.sockSend).not.toHaveBeenCalled();
+        expect(state.makeWASocket).toHaveBeenCalledTimes(2); // the original plus exactly one re-arm
+        expect(logged(warnSpy, `[WA:send] Not connected (ready=false, socket=false). Not sending 5 chars to ${GROUP}.`)).toBe(true);
+        expect(logged(logSpy, '[WA:send] Not connected; requesting a re-initialization.')).toBe(true);
+        // A send-driven re-arm is not a failure: the readout the admin UI renders must not move.
+        expect(svc.getStatus()).toEqual({ ...before, initializing: true });
+    });
+
+    it('3.1 five sends in a row while down open at most one socket', async () => {
+        const { svc, state } = await loadPaired();
+        conn(state, 0, closeWith(401));
+
+        const results: boolean[] = [];
+        for (let i = 0; i < 5; i++) {
+            results.push(await svc.sendMessage(GROUP, `attempt ${i}`));
+            await flush();
+        }
+
+        expect(results).toEqual([false, false, false, false, false]);
+        expect(state.makeWASocket).toHaveBeenCalledTimes(2);
+        expect(state.sockSend).not.toHaveBeenCalled();
+    });
+
+    it('3.1 the re-arm floor: a re-armed socket that is released again is not relaunched inside 60 s, but is once the floor passes', async () => {
+        const { svc, state } = await loadUnpaired();
+        conn(state, 0, closeWith(408)); // nobody scanned: released, no failure rung, no timer
+        expect(jest.getTimerCount()).toBe(0);
+
+        await svc.sendMessage(GROUP, 'first');
+        await flush();
+        expect(state.makeWASocket).toHaveBeenCalledTimes(2); // the send-driven re-arm
+
+        conn(state, 1, closeWith(408)); // released again, still no failure rung and no timer
+        expect(jest.getTimerCount()).toBe(0);
+        for (let i = 0; i < 4; i++) {
+            expect(await svc.sendMessage(GROUP, `inside the floor ${i}`)).toBe(false);
+            await flush();
+        }
+        expect(state.makeWASocket).toHaveBeenCalledTimes(2); // traffic alone cannot drive a socket per submission
+
+        await advance(SEND_REARM_MIN_INTERVAL_MS - 1);
+        await svc.sendMessage(GROUP, 'one millisecond early');
+        await flush();
+        expect(state.makeWASocket).toHaveBeenCalledTimes(2);
+
+        await advance(1);
+        await svc.sendMessage(GROUP, 'floor passed');
+        await flush();
+        expect(state.makeWASocket).toHaveBeenCalledTimes(3);
+    });
+
+    it('3.1 inside a failure-backoff window the re-arm is refused (and does not burn the floor); after it the next send re-arms', async () => {
+        const { svc, state } = await loadUnpaired();
+        await advance(WATCHDOG_MS); // a stalled unpaired socket: burns rung 1, arms no reconnect timer
+        expect(svc.getStatus().consecutiveInitFailures).toBe(1);
+        expect(jest.getTimerCount()).toBe(0);
+        const window = svc.getStatus().nextInitAllowedAt;
+        expect(window).toBeGreaterThan(Date.now());
+
+        expect(await svc.sendMessage(GROUP, 'inside the window')).toBe(false);
+        await flush();
+        expect(state.makeWASocket).toHaveBeenCalledTimes(1); // the ladder owns recovery
+
+        await advance(LADDER_MS[0]);
+        expect(await svc.sendMessage(GROUP, 'window open')).toBe(false);
+        await flush();
+        expect(state.makeWASocket).toHaveBeenCalledTimes(2);
+        // The send-driven re-arm neither extended nor reset the failure ladder the admin UI shows.
+        expect(svc.getStatus().nextInitAllowedAt).toBe(window);
+        expect(svc.getStatus().consecutiveInitFailures).toBe(1);
+    });
+
+    it('3.1 a scheduled reconnect owns recovery: a send while it is pending opens nothing, and the timer opens exactly one socket', async () => {
+        const { svc, state } = await loadPaired();
+        conn(state, 0, closeWith(408)); // registered session: transient, reconnect armed
+        expect(jest.getTimerCount()).toBe(1);
+
+        const result = await svc.sendMessage(GROUP, 'while a reconnect is pending');
+        await flush();
+
+        expect(result).toBe(false);
+        expect(state.makeWASocket).toHaveBeenCalledTimes(1);
+        expect(jest.getTimerCount()).toBe(1); // the send did not disturb the reconnect timer
+
+        await advance(LADDER_MS[0]);
+        expect(state.makeWASocket).toHaveBeenCalledTimes(2); // the timer, and only the timer
+    });
+
+    it('3.1 reaching open resets the re-arm floor: a healthy connection makes the earlier throttle stale', async () => {
+        const { svc, state } = await loadUnpaired();
+        conn(state, 0, closeWith(408));
+        await svc.sendMessage(GROUP, 'arms the floor');
+        await flush();
+        expect(state.makeWASocket).toHaveBeenCalledTimes(2);
+
+        conn(state, 1, { connection: 'open' });
+        conn(state, 1, closeWith(408)); // an unpaired socket that then drops is released, no timer
+        await svc.sendMessage(GROUP, 'straight after a good connection');
+        await flush();
+
+        expect(state.makeWASocket).toHaveBeenCalledTimes(3);
+    });
+
+    it('3.1 logout resets the re-arm floor', async () => {
+        const { svc, state } = await loadUnpaired();
+        conn(state, 0, closeWith(408));
+        await svc.sendMessage(GROUP, 'arms the floor');
+        await flush();
+        expect(state.makeWASocket).toHaveBeenCalledTimes(2);
+
+        await svc.logout(); // ends socket 1, then its own forced re-arm opens socket 2
+        await flush();
+        expect(state.makeWASocket).toHaveBeenCalledTimes(3);
+        conn(state, 2, closeWith(408)); // released
+        await svc.sendMessage(GROUP, 'straight after a logout');
+        await flush();
+
+        expect(state.makeWASocket).toHaveBeenCalledTimes(4);
+    });
+
+    it('3.1 once shutdown has begun a send neither sends nor re-arms', async () => {
+        const { svc, state } = await loadOpen();
+        await signalHandlers.SIGTERM();
+
+        const result = await svc.sendMessage(GROUP, 'too late');
+        await flush();
+
+        expect(result).toBe(false);
+        expect(state.sockSend).not.toHaveBeenCalled();
+        expect(state.makeWASocket).toHaveBeenCalledTimes(1);
+    });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Spec 3.2 - send while connecting
+// ---------------------------------------------------------------------------------------------
+
+describe('spec 3.2: send while connecting', () => {
+    it('3.2 socket built but not open: false, the socket untouched, no second socket', async () => {
+        const { svc, state } = await loadPaired();
+        expect(svc.getStatus().initializing).toBe(true);
+
+        const result = await svc.sendMessage(GROUP, 'hello');
+        await flush();
+
+        expect(result).toBe(false);
+        expect(state.sockSend).not.toHaveBeenCalled();
+        expect(state.makeWASocket).toHaveBeenCalledTimes(1);
+        expect(state.useAuthState).toHaveBeenCalledTimes(1);
+        expect(logged(warnSpy, `[WA:send] Not connected (ready=false, socket=true). Not sending 5 chars to ${GROUP}.`)).toBe(true);
+        expect(logged(logSpy, 'requesting a re-initialization')).toBe(false); // it returned at the isInitializing guard
+    });
+
+    it('3.2 the window between initialize() being called and a socket existing: false, and still only one launch', async () => {
+        const gate = deferred();
+        const { svc, state } = await loadPaired({ authPlan: [gate] });
+        expect(state.makeWASocket).not.toHaveBeenCalled(); // the bootstrap launch is parked in useMultiFileAuthState()
+        expect(svc.getStatus().initializing).toBe(true);
+
+        const result = await svc.sendMessage(GROUP, 'hello');
+        await flush();
+
+        expect(result).toBe(false);
+        expect(state.sockSend).not.toHaveBeenCalled();
+        expect(state.useAuthState).toHaveBeenCalledTimes(1);
+
+        gate.resolve();
+        await flush();
+        expect(state.makeWASocket).toHaveBeenCalledTimes(1); // the parked launch completes, and nothing duplicated it
+    });
+
+    it('3.2 sends while connecting do not consume the re-arm floor: the first send after a release re-arms at once', async () => {
+        const { svc, state } = await loadUnpaired();
+        const before = svc.getStatus();
+
+        for (let i = 0; i < 3; i++) expect(await svc.sendMessage(GROUP, `while connecting ${i}`)).toBe(false);
+        await flush();
+        expect(state.makeWASocket).toHaveBeenCalledTimes(1);
+        expect(svc.getStatus()).toEqual(before);
+
+        conn(state, 0, closeWith(408)); // released
+        await svc.sendMessage(GROUP, 'after the release');
+        await flush();
+
+        expect(state.makeWASocket).toHaveBeenCalledTimes(2); // not blocked by a floor a connecting send should never have set
+    });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Spec 3.3 - the ack arrives before the message key (the early-ack race)
+// ---------------------------------------------------------------------------------------------
+
+describe('spec 3.3: the ack arrives before the key', () => {
+    it('3.3 an ack that lands while sock.sendMessage() is still pending resolves true with no ack timer ever armed', async () => {
+        const { svc, state } = await loadOpen();
+        expect(jest.getTimerCount()).toBe(0);
+        const parked = parkSend(state, sentKey('MSGID1'));
+
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+        expect(jest.getTimerCount()).toBe(1); // the relay deadline, nothing else yet
+
+        serverAck(state, 0, { id: 'MSGID1' }); // beats the waiter's registration
+        expect(send.done).toBe(false); // still parked at the relay: an ack alone cannot answer a send that has no id yet
+        parked.release();
+        await flush();
+
+        expect(send.value).toBe(true);
+        expect(jest.getTimerCount()).toBe(0); // relay timer cleared in finally; the ack timer never existed
+        expect(logged(logSpy, `[WA:send] WhatsApp accepted the message to ${GROUP} (id=MSGID1).`)).toBe(true);
+    });
+
+    it('3.3 an early REJECTED outcome resolves false the same way', async () => {
+        const { svc, state } = await loadOpen();
+        const parked = parkSend(state, sentKey('MSGID1'));
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+
+        serverAck(state, 0, { id: 'MSGID1', error: '403' });
+        parked.release();
+        await flush();
+
+        expect(send.value).toBe(false);
+        expect(jest.getTimerCount()).toBe(0);
+        expect(logged(errorSpy, `[WA:send] WhatsApp REJECTED the message to ${GROUP} (id=MSGID1).`)).toBe(true);
+    });
+
+    it('3.3 an early messages.update is buffered too: status 3 accepts, status 0 rejects', async () => {
+        const { svc, state } = await loadOpen();
+        state.sockSend.mockResolvedValue(sentKey('DIRECT1', DIRECT));
+
+        const accepted = parkSend(state, sentKey('DIRECT1', DIRECT));
+        const okSend = track(svc.sendMessage(DIRECT, 'ok'));
+        await flush();
+        msgUpdate(state, 0, [{ key: { id: 'DIRECT1' }, update: { status: 3 } }]);
+        accepted.release();
+        await flush();
+        expect(okSend.value).toBe(true);
+
+        const refused = parkSend(state, sentKey('DIRECT2', DIRECT));
+        const badSend = track(svc.sendMessage(DIRECT, 'bad'));
+        await flush();
+        msgUpdate(state, 0, [{ key: { id: 'DIRECT2' }, update: { status: 0 } }]);
+        refused.release();
+        await flush();
+        expect(badSend.value).toBe(false);
+        expect(jest.getTimerCount()).toBe(0);
+    });
+
+    it('3.3 a rejection overwrites a buffered acceptance: evidence WhatsApp refused it outranks evidence it accepted', async () => {
+        const { svc, state } = await loadOpen();
+        const parked = parkSend(state, sentKey('MSGID1'));
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+
+        serverAck(state, 0, { id: 'MSGID1' });
+        serverAck(state, 0, { id: 'MSGID1', error: '463' });
+        parked.release();
+        await flush();
+
+        expect(send.value).toBe(false);
+    });
+
+    it('3.3 a buffered rejection is never overwritten by a later acceptance', async () => {
+        const { svc, state } = await loadOpen();
+        const parked = parkSend(state, sentKey('MSGID1'));
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+
+        serverAck(state, 0, { id: 'MSGID1', error: '403' });
+        serverAck(state, 0, { id: 'MSGID1' });
+        msgUpdate(state, 0, [{ key: { id: 'MSGID1' }, update: { status: 3 } }]);
+        parked.release();
+        await flush();
+
+        expect(send.value).toBe(false);
+    });
+
+    it('3.3 with no send in flight an inbound ack is DROPPED, not buffered: 500 of them cannot confirm a later send', async () => {
+        const { svc, state } = await loadOpen();
+        for (let i = 0; i < 500; i++) serverAck(state, 0, { id: `STRAY${i}` });
+        for (let i = 0; i < 500; i++) msgUpdate(state, 0, [{ key: { id: `STRAY${i}` }, update: { status: 3 } }]);
+        // The LAST one: were the gate missing, FIFO eviction would still be holding it.
+        state.sockSend.mockResolvedValue(sentKey('STRAY499'));
+
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+        expect(send.done).toBe(false); // not confirmed by an ack that predates the send
+
+        await advance(ACK_TIMEOUT_MS);
+        expect(send.value).toBe(false);
+    });
+
+    it('3.3 a single stray ack before the send is dropped too', async () => {
+        const { svc, state } = await loadOpen();
+        serverAck(state, 0, { id: 'MSGID1' }); // nothing in flight: somebody else\'s business
+
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+        expect(send.done).toBe(false);
+
+        await advance(ACK_TIMEOUT_MS);
+        expect(send.value).toBe(false);
+    });
+
+    it('3.3 the early buffer is bounded at 200 with FIFO eviction: the oldest 50 of 250 are forgotten, the newest 200 kept', async () => {
+        const { svc, state } = await loadOpen();
+        const total = MAX_EARLY_ACKS + 50;
+        // E0 and E49 are the two oldest boundary ids (evicted); E50 is the oldest survivor; E249 the newest.
+        const probes = ['E0', 'E49', 'E50', `E${total - 1}`];
+        const gates = probes.map((id) => parkSend(state, sentKey(id)));
+        const sends = probes.map((_, i) => track(svc.sendMessage(GROUP, `probe ${i}`)));
+        await flush();
+
+        for (let i = 0; i < total; i++) serverAck(state, 0, { id: `E${i}` });
+        gates.forEach((gate) => gate.release());
+        await flush();
+
+        // The two survivors confirm from the buffer; the two evicted ones register a waiter and wait.
+        expect(sends.map((s) => s.value)).toEqual([undefined, undefined, true, true]);
+        await advance(ACK_TIMEOUT_MS);
+        expect(sends.map((s) => s.value)).toEqual([false, false, true, true]);
+    });
+
+    it('3.3 a detach clears the buffer: an outcome buffered on a dead socket cannot confirm a send on its successor', async () => {
+        const { svc, state } = await loadOpen();
+        const parked = parkSend(state, sentKey('OLD'));
+        const doomed = track(svc.sendMessage(GROUP, 'in flight when the socket dies'));
+        await flush();
+        serverAck(state, 0, { id: 'CARRYOVER' }); // buffered: a send is in flight
+
+        conn(state, 0, closeWith(408)); // detach clears the buffer wholesale
+        parked.release();
+        await flush();
+        expect(doomed.value).toBe(false);
+
+        await advance(LADDER_MS[0]);
+        conn(state, 1, { connection: 'open' });
+        state.sockSend.mockResolvedValue(sentKey('CARRYOVER'));
+        const send = track(svc.sendMessage(GROUP, 'on the new socket'));
+        await flush();
+        expect(send.done).toBe(false);
+
+        await advance(ACK_TIMEOUT_MS);
+        expect(send.value).toBe(false);
+    });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Spec 3.4 - the ack never arrives
+// ---------------------------------------------------------------------------------------------
+
+describe('spec 3.4: the ack never arrives', () => {
+    it('3.4 times out false at exactly the ack budget, naming the id and the timeout', async () => {
+        const { svc, state } = await loadOpen();
+
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+        expect(jest.getTimerCount()).toBe(1);
+
+        await advance(ACK_TIMEOUT_MS - 1);
+        expect(send.done).toBe(false);
+        await advance(1);
+
+        expect(send.value).toBe(false);
+        expect(logged(errorSpy, `[WA:send] No acknowledgement from WhatsApp for ${GROUP} (id=MSGID1) within ${ACK_TIMEOUT_MS}ms. Treating as not sent.`)).toBe(true);
+        expect(jest.getTimerCount()).toBe(0);
+        // Nothing waits any more: the next send is unaffected by the corpse of the last.
+        await expectStrayAckIsDropped(svc, state);
+    });
+
+    it('3.4 sock.sendMessage() resolving is NOT confirmation: a resolved relay with no ack is false (the July shape)', async () => {
+        const { svc, state } = await loadOpen();
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+
+        expect(state.sockSend).toHaveBeenCalledTimes(1); // the relay has resolved with a key
+        expect(send.done).toBe(false); // and that alone must not have answered
+
+        await advance(ACK_TIMEOUT_MS);
+        expect(send.value).toBe(false);
+    });
+
+    it('3.4 the WAMessage returned by sock.sendMessage() is not evidence: its local status and ack fields settle nothing', async () => {
+        // Baileys stamps status PENDING (and here, adversarially, even SERVER_ACK) on the object
+        // before the stanza is encrypted. Only events that originate at WhatsApp may settle a send.
+        const { svc, state } = await loadOpen();
+        state.sockSend.mockResolvedValue({ key: { id: 'MSGID1', remoteJid: GROUP, fromMe: true }, status: 2, ack: 3 });
+
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+        expect(send.done).toBe(false);
+
+        await advance(ACK_TIMEOUT_MS);
+        expect(send.value).toBe(false);
+    });
+
+    it('3.4 an ack after the timeout does not throw, does not flip the result, and does not linger', async () => {
+        const { svc, state } = await loadOpen();
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+        await advance(ACK_TIMEOUT_MS);
+        expect(send.value).toBe(false);
+        const lines = totalSendLines();
+
+        expect(() => serverAck(state, 0, { id: 'MSGID1' })).not.toThrow();
+        expect(() => msgUpdate(state, 0, [{ key: { id: 'MSGID1' }, update: { status: 3 } }])).not.toThrow();
+        await flush();
+
+        expect(send.value).toBe(false);
+        expect(totalSendLines()).toBe(lines); // not even a log line
+        // ... and, having arrived with nothing in flight, it was dropped: a same-id send is not pre-confirmed.
+        const again = track(svc.sendMessage(GROUP, 'again'));
+        await flush();
+        expect(again.done).toBe(false);
+        await advance(ACK_TIMEOUT_MS);
+        expect(again.value).toBe(false);
+    });
+
+    it('3.4 a late ack that DID get buffered (another send in flight) dies with the next detach', async () => {
+        const { svc, state } = await loadOpen();
+        const first = track(svc.sendMessage(GROUP, 'first'));
+        await flush();
+        await advance(ACK_TIMEOUT_MS);
+        expect(first.value).toBe(false); // MSGID1 timed out
+
+        const parked = parkSend(state, sentKey('MSGID2'));
+        const second = track(svc.sendMessage(GROUP, 'second'));
+        await flush();
+        serverAck(state, 0, { id: 'MSGID1' }); // late, and buffered because `second` is in flight
+        parked.release();
+        await flush();
+        serverAck(state, 0, { id: 'MSGID2' });
+        await flush();
+        expect(second.value).toBe(true);
+
+        conn(state, 0, closeWith(408)); // the next detach runs
+        await advance(LADDER_MS[0]);
+        conn(state, 1, { connection: 'open' });
+        state.sockSend.mockResolvedValue(sentKey('MSGID1'));
+        const third = track(svc.sendMessage(GROUP, 'third'));
+        await flush();
+        expect(third.done).toBe(false); // the buffered MSGID1 did not survive the detach
+        await advance(ACK_TIMEOUT_MS);
+        expect(third.value).toBe(false);
+    });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Spec 3.5 - ERROR status (0), the truthiness trap
+// ---------------------------------------------------------------------------------------------
+
+describe('spec 3.5: an ERROR outcome', () => {
+    it('3.5 a server ack carrying an error attribute (the group failure signal) resolves false and logs a rejection naming the id', async () => {
+        const { svc, state } = await loadOpen();
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+
+        serverAck(state, 0, { id: 'MSGID1', error: '403' });
+        await flush();
+
+        expect(send.value).toBe(false);
+        expect(logged(logSpy, '[WA:send] Rejected id=MSGID1 (server ack error=403).')).toBe(true);
+        expect(logged(errorSpy, `[WA:send] WhatsApp REJECTED the message to ${GROUP} (id=MSGID1).`)).toBe(true);
+        expect(jest.getTimerCount()).toBe(0); // it did not wait out the ack budget
+    });
+
+    it('3.5 messages.update with status 0 (ERROR) resolves false and logs a rejection: 0 is NOT "absent"', async () => {
+        const { svc, state } = await loadOpen();
+        state.sockSend.mockResolvedValue(sentKey('MSGID1', DIRECT));
+        const send = track(svc.sendMessage(DIRECT, 'hello'));
+        await flush();
+
+        msgUpdate(state, 0, [{ key: { id: 'MSGID1' }, update: { status: 0 } }]);
+        await flush();
+
+        expect(send.value).toBe(false);
+        expect(logged(logSpy, '[WA:send] Rejected id=MSGID1 (status=ERROR).')).toBe(true);
+        expect(logged(errorSpy, `[WA:send] WhatsApp REJECTED the message to ${DIRECT} (id=MSGID1).`)).toBe(true);
+        expect(jest.getTimerCount()).toBe(0); // rejected NOW, not "ignored, then timed out"
+    });
+
+    it('3.5 control: status 1 (PENDING) does NOT settle the send, which then times out (and is not called a rejection)', async () => {
+        const { svc, state } = await loadOpen();
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+
+        msgUpdate(state, 0, [{ key: { id: 'MSGID1' }, update: { status: 1 } }]);
+        await flush();
+        expect(send.done).toBe(false);
+
+        await advance(ACK_TIMEOUT_MS);
+        expect(send.value).toBe(false);
+        expect(logged(errorSpy, '[WA:send] No acknowledgement from WhatsApp')).toBe(true);
+        expect(logged(errorSpy, 'REJECTED')).toBe(false);
+    });
+
+    it('3.5 status 0 after a PENDING is still a rejection', async () => {
+        const { svc, state } = await loadOpen();
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+
+        msgUpdate(state, 0, [{ key: { id: 'MSGID1' }, update: { status: 1 } }]);
+        msgUpdate(state, 0, [{ key: { id: 'MSGID1' }, update: { status: 0 } }]);
+        await flush();
+
+        expect(send.value).toBe(false);
+        expect(logged(errorSpy, 'REJECTED')).toBe(true);
+    });
+
+    it('3.5 a status that arrives as the string "0" is still an ERROR', async () => {
+        const { svc, state } = await loadOpen();
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+
+        msgUpdate(state, 0, [{ key: { id: 'MSGID1' }, update: { status: '0' } }]);
+        await flush();
+
+        expect(send.value).toBe(false);
+        expect(logged(errorSpy, 'REJECTED')).toBe(true);
+    });
+
+    it.each([2, 3, 4, 5])('3.5 status %i (SERVER_ACK and above) is acceptance: the threshold is >= 2, inclusive', async (status) => {
+        const { svc, state } = await loadOpen();
+        state.sockSend.mockResolvedValue(sentKey('MSGID1', DIRECT));
+        const send = track(svc.sendMessage(DIRECT, 'hello'));
+        await flush();
+
+        msgUpdate(state, 0, [{ key: { id: 'MSGID1' }, update: { status } }]);
+        await flush();
+
+        expect(send.value).toBe(true);
+        expect(logged(logSpy, `[WA:send] Acknowledged id=MSGID1 (status=${status}).`)).toBe(true);
+    });
+
+    it('3.5 an update whose status is absent, null or not a number is not ours to judge: it neither accepts nor rejects', async () => {
+        const { svc, state } = await loadOpen();
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+
+        msgUpdate(state, 0, [
+            { key: { id: 'MSGID1' }, update: {} },
+            { key: { id: 'MSGID1' }, update: { status: null } },
+            { key: { id: 'MSGID1' }, update: { status: undefined } },
+            { key: { id: 'MSGID1' }, update: { status: 'banana' } },
+            { key: { id: 'MSGID1' }, update: { status: Number.NaN } },
+        ]);
+        await flush();
+        expect(send.done).toBe(false);
+
+        await advance(ACK_TIMEOUT_MS);
+        expect(send.value).toBe(false);
+        expect(logged(errorSpy, 'REJECTED')).toBe(false);
+    });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Spec 3.6 - disconnect mid-send
+// ---------------------------------------------------------------------------------------------
+
+describe('spec 3.6: disconnect mid-send', () => {
+    it.each([408, 428, 500])('3.6 a close (%i) while waiting for the ack fails the send NOW, not after the ack budget', async (code) => {
+        const { svc, state } = await loadOpen();
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+        expect(send.done).toBe(false);
+        expect(jest.getTimerCount()).toBe(1); // the ack timer
+
+        conn(state, 0, closeWith(code));
+        await flush(); // no advance(): promptness is the point
+
+        expect(send.value).toBe(false);
+        expect(logged(warnSpy, `[WA:send] The send to ${GROUP} (id=MSGID1) was abandoned before WhatsApp acknowledged it. Treating as not sent.`)).toBe(true);
+        expect(logged(warnSpy, `[WA:send] Settled 1 in-flight send(s) as unconfirmed: the socket closed (statusCode=${code}).`)).toBe(true);
+        expect(logged(errorSpy, 'No acknowledgement from WhatsApp')).toBe(false);
+        // The ack timer was cleared: what remains is the reconnect timer and nothing else.
+        expect(jest.getTimerCount()).toBe(1);
+    });
+
+    it('3.6 a 401 close fails the send too, and nothing is left ticking', async () => {
+        const { svc, state } = await loadOpen();
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+
+        conn(state, 0, closeWith(401));
+        await flush();
+
+        expect(send.value).toBe(false);
+        expect(jest.getTimerCount()).toBe(0); // stand-down: no reconnect, and the ack timer is gone
+    });
+
+    it('3.6 every in-flight send is settled by the one close, and the log says how many', async () => {
+        const { svc, state } = await loadOpen();
+        state.sockSend.mockResolvedValueOnce(sentKey('MSGID1')).mockResolvedValueOnce(sentKey('MSGID2'));
+        const first = track(svc.sendMessage(GROUP, 'one'));
+        const second = track(svc.sendMessage(GROUP, 'two'));
+        await flush();
+        expect(jest.getTimerCount()).toBe(2);
+
+        conn(state, 0, closeWith(408));
+        await flush();
+
+        expect(first.value).toBe(false);
+        expect(second.value).toBe(false);
+        expect(logged(warnSpy, '[WA:send] Settled 2 in-flight send(s) as unconfirmed: the socket closed (statusCode=408).')).toBe(true);
+        expect(jest.getTimerCount()).toBe(1);
+    });
+
+    it('3.6 an ack fired at the dead socket afterwards changes nothing', async () => {
+        const { svc, state } = await loadOpen();
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+        conn(state, 0, closeWith(408));
+        await flush();
+        expect(send.value).toBe(false);
+        const lines = totalSendLines();
+
+        lateServerAck(state, 0, { id: 'MSGID1' });
+        lateServerAck(state, 0, { id: 'MSGID1', error: '403' });
+        emitLate(state, 0, 'messages.update', [{ key: { id: 'MSGID1' }, update: { status: 3 } }]);
+        await flush();
+
+        expect(send.value).toBe(false);
+        expect(totalSendLines()).toBe(lines);
+        expect(logged(logSpy, 'Acknowledged')).toBe(false);
+    });
+
+    it('3.6 variant: the socket closes while sock.sendMessage() is still pending: false via the "socket was replaced" branch, no ack timer', async () => {
+        const { svc, state } = await loadOpen();
+        const parked = parkSend(state, sentKey('MSGID1'));
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+        expect(jest.getTimerCount()).toBe(1); // the relay deadline
+
+        conn(state, 0, closeWith(408)); // nothing is registered to settle yet
+        expect(send.done).toBe(false);
+        expect(jest.getTimerCount()).toBe(2); // relay deadline + reconnect
+        parked.release();
+        await flush();
+
+        expect(send.value).toBe(false);
+        expect(logged(warnSpy, `[WA:send] The socket was replaced while sending to ${GROUP}; the outcome is unknown. Recording as not sent.`)).toBe(true);
+        expect(logged(warnSpy, 'abandoned before WhatsApp acknowledged it')).toBe(false);
+        expect(jest.getTimerCount()).toBe(1); // only the reconnect timer: no ack timer was armed for a dead socket
+    });
+
+    it('3.6 variant: a send that was mid-relay when the socket closed leaves no in-flight count behind', async () => {
+        const { svc, state } = await loadOpen();
+        const parked = parkSend(state, sentKey('MSGID1'));
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+        conn(state, 0, closeWith(408));
+        parked.release();
+        await flush();
+        expect(send.value).toBe(false);
+
+        await advance(LADDER_MS[0]);
+        conn(state, 1, { connection: 'open' });
+
+        await expectStrayAckIsDropped(svc, state, 1);
+    });
+
+    it('3.6 teardownSocket() (the connect-watchdog and post-attach-throw path) settles waiters too', async () => {
+        // White-box, and honestly so. Not reachable through the public API: the watchdog is
+        // cleared at 'open' and a send needs an open socket, so no waiter can coexist with a
+        // teardown today. The waiter is planted through the private map to pin the WIRING: that
+        // teardownSocket() funnels through detachSocket(), which is what stops a future path
+        // from forgetting to settle.
+        const { svc } = await loadOpen();
+        const outcomes: string[] = [];
+        internals(svc).pendingSends.set('PLANTED', (outcome) => outcomes.push(outcome));
+
+        internals(svc).teardownSocket();
+
+        expect(outcomes).toEqual(['abandoned']);
+        expect(internals(svc).pendingSends.size).toBe(0);
+        expect(logged(warnSpy, '[WA:send] Settled 1 in-flight send(s) as unconfirmed: the socket was torn down.')).toBe(true);
+    });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Spec 3.7 - logout mid-send
+// ---------------------------------------------------------------------------------------------
+
+describe('spec 3.7: logout mid-send', () => {
+    it('3.7 logout() fails an in-flight send, resolves true, and still re-arms', async () => {
+        const { svc, state } = await loadOpen();
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+        expect(send.done).toBe(false);
+
+        const result = await svc.logout();
+        await flush();
+
+        expect(result).toBe(true);
+        expect(send.value).toBe(false);
+        expect(logged(warnSpy, '[WA:send] Settled 1 in-flight send(s) as unconfirmed: an admin logout.')).toBe(true);
+        expect(logged(warnSpy, 'abandoned before WhatsApp acknowledged it')).toBe(true);
+        expect(state.makeWASocket).toHaveBeenCalledTimes(2); // the forced re-arm is unaffected by the pending send
+        expect(alertReasons()).toEqual([]);
+        expect(jest.getTimerCount()).toBe(1); // only the re-armed socket's connect watchdog: no ack timer survived
+    });
+
+    it('3.7 the settle is logged once: the second, unconditional call in logout() finds nothing and says nothing', async () => {
+        const { svc } = await loadOpen();
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+
+        await svc.logout();
+        await flush();
+
+        expect(send.value).toBe(false);
+        expect(countLogged(warnSpy, 'Settled')).toBe(1);
+    });
+
+    it('3.7 with the real library\'s ordering (the loggedOut close lands DURING sock.logout()) the send is still failed and the alert stays suppressed', async () => {
+        const { svc, state } = await loadOpen();
+        state.sockLogout.mockImplementation(async () => {
+            conn(state, 0, closeWith(401)); // what Baileys does: logout() ends the socket and the close fires
+        });
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+
+        const result = await svc.logout();
+        await flush();
+
+        expect(result).toBe(true);
+        expect(send.value).toBe(false);
+        expect(logged(warnSpy, 'Settled 1 in-flight send(s) as unconfirmed: the socket closed (statusCode=401)')).toBe(true);
+        expect(logged(logSpy, 'Intentional admin logout')).toBe(true);
+        expect(alertReasons()).toEqual([]); // intentionalLogout suppressed wa_session_lost
+    });
+
+    it('3.7 logout() stays bounded by SOCKET_END_TIMEOUT_MS: a pending send neither delays it nor waits out its own 20 s', async () => {
+        const { svc, state } = await loadOpen();
+        state.sockLogout.mockReturnValue(new Promise(() => undefined)); // sock.logout() never settles
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+
+        const logout = track(svc.logout());
+        await advance(SOCKET_END_TIMEOUT_MS - 1);
+        expect(logout.done).toBe(false);
+
+        await advance(1);
+        expect(logout.value).toBe(true); // 5 s, not 5 s plus anything a send contributed
+        expect(send.value).toBe(false); // and the send did not have to run out its 20 s budget
+        expect(state.makeWASocket).toHaveBeenCalledTimes(2);
+    });
+
+    it('3.7 logout() after a 401 stand-down (this.sock is null) still settles anything left waiting', async () => {
+        // White-box, and honestly so. After a stand-down no waiter can exist (the close already
+        // settled them all), so the unconditional settle in logout() is a backstop for a state the
+        // public API cannot construct. The waiter is planted to prove the backstop is wired, since
+        // the detach inside logout() is skipped when there is no socket.
+        const { svc, state } = await loadOpen();
+        conn(state, 0, closeWith(401));
+        const outcomes: string[] = [];
+        internals(svc).pendingSends.set('PLANTED', (outcome) => outcomes.push(outcome));
+
+        const result = await svc.logout();
+        await flush();
+
+        expect(result).toBe(true);
+        expect(outcomes).toEqual(['abandoned']);
+        expect(logged(warnSpy, '[WA:send] Settled 1 in-flight send(s) as unconfirmed: an admin logout.')).toBe(true);
+    });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Spec 3.8 - shutdown mid-send
+// ---------------------------------------------------------------------------------------------
+
+describe('spec 3.8: shutdown mid-send', () => {
+    it('3.8 SIGTERM with a send in flight: the send is false, the handler still reaches exit(0), no timer survives', async () => {
+        const { svc, state } = await loadOpen();
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+        expect(jest.getTimerCount()).toBe(1);
+
+        await signalHandlers.SIGTERM();
+
+        expect(send.value).toBe(false);
+        expect(exitSpy).toHaveBeenCalledWith(0);
+        expect(jest.getTimerCount()).toBe(0);
+        expect(state.sockets[0].end).toHaveBeenCalledTimes(1);
+        expect(logged(warnSpy, '[WA:send] Settled 1 in-flight send(s) as unconfirmed: SIGTERM shutdown.')).toBe(true);
+        expect(countLogged(warnSpy, 'Settled')).toBe(1); // the unconditional second call found nothing
+    });
+
+    it('3.8 SIGINT is wired the same way', async () => {
+        const { svc } = await loadOpen();
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+
+        await signalHandlers.SIGINT();
+
+        expect(send.value).toBe(false);
+        expect(logged(warnSpy, 'unconfirmed: SIGINT shutdown')).toBe(true);
+        expect(exitSpy).toHaveBeenCalledWith(0);
+    });
+
+    it('3.8 the send is settled BEFORE the socket is ended: an end() that never settles does not hold it for 5 s', async () => {
+        const { svc, state } = await loadOpen();
+        state.sockEnd.mockReturnValue(new Promise(() => undefined));
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+
+        const shutdown = signalHandlers.SIGTERM();
+        await flush(); // no advance()
+
+        expect(send.value).toBe(false);
+        expect(exitSpy).not.toHaveBeenCalled(); // still waiting on end()
+
+        await advance(SOCKET_END_TIMEOUT_MS);
+        await shutdown;
+        expect(exitSpy).toHaveBeenCalledWith(0);
+        expect(jest.getTimerCount()).toBe(0);
+    });
+
+    it('3.8 a send that was mid-relay at shutdown resolves false through the "socket was replaced" branch', async () => {
+        const { svc, state } = await loadOpen();
+        const parked = parkSend(state, sentKey('MSGID1'));
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+
+        await signalHandlers.SIGTERM();
+        parked.release();
+        await flush();
+
+        expect(send.value).toBe(false);
+        expect(logged(warnSpy, 'The socket was replaced while sending')).toBe(true);
+        expect(jest.getTimerCount()).toBe(0); // no ack timer for a process that is exiting
+    });
+
+    it('3.8 the ack and relay timers are both unref()d, so a pending send cannot hold the event loop open through a shutdown', async () => {
+        const { svc, state } = await loadOpen();
+
+        await withUnrefTracking(async (seen) => {
+            const send = track(svc.sendMessage(GROUP, 'hello'));
+            await flush();
+
+            const relay = seen.filter((t) => t.ms === RELAY_TIMEOUT_MS);
+            const ack = seen.filter((t) => t.ms === ACK_TIMEOUT_MS);
+            expect(relay).toHaveLength(1);
+            expect(ack).toHaveLength(1);
+            expect(relay[0].unref).toHaveBeenCalled();
+            expect(ack[0].unref).toHaveBeenCalled();
+
+            serverAck(state, 0, { id: 'MSGID1' });
+            await flush();
+            expect(send.value).toBe(true);
+        });
+    });
+
+    it('3.8 shutdown after a 401 stand-down (this.sock is null) still settles anything left waiting, and exits', async () => {
+        // White-box for the same reason as the logout() twin: the settle sits outside the
+        // `if (sock)` precisely because the socket can already be gone, and the state that would
+        // exercise it is not constructible through the public API.
+        const { svc, state } = await loadOpen();
+        conn(state, 0, closeWith(401));
+        const outcomes: string[] = [];
+        internals(svc).pendingSends.set('PLANTED', (outcome) => outcomes.push(outcome));
+
+        await signalHandlers.SIGTERM();
+
+        expect(outcomes).toEqual(['abandoned']);
+        expect(logged(warnSpy, '[WA:send] Settled 1 in-flight send(s) as unconfirmed: SIGTERM shutdown.')).toBe(true);
+        expect(exitSpy).toHaveBeenCalledWith(0);
+    });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Spec 3.9 - two concurrent sends
+// ---------------------------------------------------------------------------------------------
+
+describe('spec 3.9: two concurrent sends', () => {
+    it('3.9 acking only MSGID2 resolves the second true while the first keeps waiting, then times out false', async () => {
+        const { svc, state } = await loadOpen();
+        state.sockSend.mockResolvedValueOnce(sentKey('MSGID1')).mockResolvedValueOnce(sentKey('MSGID2'));
+
+        const first = track(svc.sendMessage(GROUP, 'to group one'));
+        const second = track(svc.sendMessage(GROUP, 'to group two'));
+        await flush();
+        expect(state.sockSend.mock.calls.map((call) => call[1])).toEqual([
+            { text: 'to group one', linkPreview: null },
+            { text: 'to group two', linkPreview: null },
+        ]);
+
+        serverAck(state, 0, { id: 'MSGID2' });
+        await flush();
+        expect(second.value).toBe(true);
+        expect(first.done).toBe(false); // outcomes are not crossed
+
+        await advance(ACK_TIMEOUT_MS);
+        expect(first.value).toBe(false);
+        expect(second.value).toBe(true);
+    });
+
+    it('3.9 acking both in reverse order resolves both true', async () => {
+        const { svc, state } = await loadOpen();
+        state.sockSend.mockResolvedValueOnce(sentKey('MSGID1')).mockResolvedValueOnce(sentKey('MSGID2'));
+        const first = track(svc.sendMessage(GROUP, 'one'));
+        const second = track(svc.sendMessage(GROUP, 'two'));
+        await flush();
+
+        serverAck(state, 0, { id: 'MSGID2' });
+        serverAck(state, 0, { id: 'MSGID1' });
+        await flush();
+
+        expect(first.value).toBe(true);
+        expect(second.value).toBe(true);
+        expect(jest.getTimerCount()).toBe(0);
+    });
+
+    it('3.9 a rejection of one send does not touch its neighbour', async () => {
+        const { svc, state } = await loadOpen();
+        state.sockSend.mockResolvedValueOnce(sentKey('MSGID1')).mockResolvedValueOnce(sentKey('MSGID2'));
+        const first = track(svc.sendMessage(GROUP, 'one'));
+        const second = track(svc.sendMessage(GROUP, 'two'));
+        await flush();
+
+        serverAck(state, 0, { id: 'MSGID1', error: '403' });
+        serverAck(state, 0, { id: 'MSGID2' });
+        await flush();
+
+        expect(first.value).toBe(false);
+        expect(second.value).toBe(true);
+    });
+
+    it('3.9 one messages.update carrying two ids settles both waiters', async () => {
+        const { svc, state } = await loadOpen();
+        state.sockSend.mockResolvedValueOnce(sentKey('MSGID1', DIRECT)).mockResolvedValueOnce(sentKey('MSGID2', DIRECT));
+        const first = track(svc.sendMessage(DIRECT, 'one'));
+        const second = track(svc.sendMessage(DIRECT, 'two'));
+        await flush();
+
+        msgUpdate(state, 0, [
+            { key: { id: 'MSGID1' }, update: { status: 2 } },
+            { key: { id: 'MSGID2' }, update: { status: 0 } },
+        ]);
+        await flush();
+
+        expect(first.value).toBe(true);
+        expect(second.value).toBe(false);
+    });
+
+    it('3.9 the pending-send cap: the 100th send is admitted, the 101st is shed at once, and a slot frees when one settles', async () => {
+        const { svc, state } = await loadOpen();
+        let n = 0;
+        state.sockSend.mockImplementation(async () => sentKey(`M${n++}`));
+
+        const sends: Array<Tracked<boolean>> = [];
+        for (let i = 0; i < MAX_PENDING_SENDS - 1; i++) sends.push(track(svc.sendMessage(GROUP, `m${i}`)));
+        await flush(); // 99 waiters registered
+        sends.push(track(svc.sendMessage(GROUP, 'the hundredth')));
+        await flush();
+        expect(state.sockSend).toHaveBeenCalledTimes(MAX_PENDING_SENDS); // admitted: 99 pending is below the cap
+        expect(sends.every((s) => !s.done)).toBe(true);
+
+        const shed = await svc.sendMessage(GROUP, 'one too many');
+
+        expect(shed).toBe(false);
+        expect(state.sockSend).toHaveBeenCalledTimes(MAX_PENDING_SENDS); // never reached the socket
+        expect(logged(errorSpy, `[WA:send] ${MAX_PENDING_SENDS} sends already awaiting acknowledgement (cap ${MAX_PENDING_SENDS}). Shedding this one.`)).toBe(true);
+
+        serverAck(state, 0, { id: 'M0' });
+        await flush();
+        expect(sends[0].value).toBe(true);
+        const next = track(svc.sendMessage(GROUP, 'now it fits'));
+        await flush();
+        expect(state.sockSend).toHaveBeenCalledTimes(MAX_PENDING_SENDS + 1);
+        expect(next.done).toBe(false);
+    });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Spec 3.10 - the same message id acked twice
+// ---------------------------------------------------------------------------------------------
+
+describe('spec 3.10: the same id acked twice', () => {
+    it('3.10 a second ack, and a later ERROR, for a settled id: no throw, the result stays true, nothing lingers', async () => {
+        const { svc, state } = await loadOpen();
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+        serverAck(state, 0, { id: 'MSGID1' });
+        await flush();
+        expect(send.value).toBe(true);
+        const lines = totalSendLines();
+
+        expect(() => serverAck(state, 0, { id: 'MSGID1' })).not.toThrow();
+        expect(() => msgUpdate(state, 0, [{ key: { id: 'MSGID1' }, update: { status: 0 } }])).not.toThrow();
+        expect(() => serverAck(state, 0, { id: 'MSGID1', error: '403' })).not.toThrow();
+        await flush();
+
+        expect(send.value).toBe(true);
+        expect(send.error).toBeUndefined();
+        expect(totalSendLines()).toBe(lines);
+        expect(jest.getTimerCount()).toBe(0);
+        // The duplicates arrived with nothing in flight and were dropped, not kept for later.
+        const again = track(svc.sendMessage(GROUP, 'same id again'));
+        await flush();
+        expect(again.done).toBe(false);
+        await advance(ACK_TIMEOUT_MS);
+        expect(again.value).toBe(false);
+    });
+
+    it('3.10 an ack delivered twice in the same tick settles once', async () => {
+        const { svc, state } = await loadOpen();
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+
+        serverAck(state, 0, { id: 'MSGID1' });
+        serverAck(state, 0, { id: 'MSGID1' });
+        await flush();
+
+        expect(send.value).toBe(true);
+        expect(countLogged(logSpy, '[WA:send] Acknowledged id=MSGID1')).toBe(1);
+        expect(countLogged(logSpy, 'WhatsApp accepted the message')).toBe(1);
+        expect(jest.getTimerCount()).toBe(0);
+    });
+
+    it('3.10 in the same tick the FIRST outcome wins: accept then reject is true, reject then accept is false', async () => {
+        const { svc, state } = await loadOpen();
+        state.sockSend.mockResolvedValueOnce(sentKey('MSGID1')).mockResolvedValueOnce(sentKey('MSGID2'));
+        const acceptedFirst = track(svc.sendMessage(GROUP, 'a'));
+        const rejectedFirst = track(svc.sendMessage(GROUP, 'b'));
+        await flush();
+
+        serverAck(state, 0, { id: 'MSGID1' });
+        serverAck(state, 0, { id: 'MSGID1', error: '403' });
+        serverAck(state, 0, { id: 'MSGID2', error: '403' });
+        serverAck(state, 0, { id: 'MSGID2' });
+        await flush();
+
+        expect(acceptedFirst.value).toBe(true);
+        expect(rejectedFirst.value).toBe(false);
+    });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Spec 3.11 - a status update for a message we never sent
+// ---------------------------------------------------------------------------------------------
+
+describe('spec 3.11: events about messages we never sent', () => {
+    it('3.11 a foreign ack and a foreign status update with no send in flight: no throw, no log, nothing buffered', async () => {
+        const { svc, state } = await loadOpen();
+
+        expect(() => serverAck(state, 0, { id: 'SOMEONE-ELSES' })).not.toThrow();
+        expect(() => msgUpdate(state, 0, [{ key: { id: 'X' }, update: { status: 2 } }])).not.toThrow();
+        expect(() => msgUpdate(state, 0, [{ key: { id: 'Y' }, update: { status: 0 } }])).not.toThrow();
+
+        expect(errorSpy).not.toHaveBeenCalled(); // no error-level noise
+        expect(totalSendLines()).toBe(0); // and no info-level chatter either
+        // Nothing buffered: a later send that happens to carry one of those ids is not pre-confirmed.
+        for (const id of ['SOMEONE-ELSES', 'X', 'Y']) {
+            state.sockSend.mockResolvedValueOnce(sentKey(id));
+            const send = track(svc.sendMessage(GROUP, 'hello'));
+            await flush();
+            expect(send.done).toBe(false);
+            await advance(ACK_TIMEOUT_MS);
+            expect(send.value).toBe(false);
+        }
+    });
+
+    it('3.11 then a real send to a different id behaves normally', async () => {
+        const { svc, state } = await loadOpen();
+        serverAck(state, 0, { id: 'SOMEONE-ELSES' });
+        msgUpdate(state, 0, [{ key: { id: 'X' }, update: { status: 2 } }]);
+
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+        serverAck(state, 0, { id: 'MSGID1' });
+        await flush();
+
+        expect(send.value).toBe(true);
+    });
+
+    it('3.11 a foreign id, while a send IS waiting, settles nothing and says nothing', async () => {
+        const { svc, state } = await loadOpen();
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+        const lines = totalSendLines();
+
+        serverAck(state, 0, { id: 'SOMEONE-ELSES' });
+        serverAck(state, 0, { id: 'SOMEONE-ELSES', error: '403' });
+        msgUpdate(state, 0, [{ key: { id: 'X' }, update: { status: 3 } }, { key: { id: 'Y' }, update: { status: 0 } }]);
+        await flush();
+
+        expect(send.done).toBe(false);
+        expect(totalSendLines()).toBe(lines);
+        serverAck(state, 0, { id: 'MSGID1' });
+        await flush();
+        expect(send.value).toBe(true);
+    });
+
+    it.each<[string, unknown]>([
+        ['a non-array object shaped like one update', { key: { id: 'MSGID1' }, update: { status: 2 } }],
+        ['null', null],
+        ['undefined', undefined],
+        ['a string', 'MSGID1'],
+        ['a number', 2],
+        ['an empty array', []],
+    ])('3.11 a messages.update payload that is %s is ignored without throwing', async (_label, payload) => {
+        const { svc, state } = await loadOpen();
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+
+        expect(() => msgUpdate(state, 0, payload)).not.toThrow();
+        await flush();
+
+        expect(send.done).toBe(false);
+        serverAck(state, 0, { id: 'MSGID1' });
+        await flush();
+        expect(send.value).toBe(true);
+    });
+
+    it('3.11 garbage elements inside a messages.update array are skipped, and a valid one in the same array is still honoured', async () => {
+        const { svc, state } = await loadOpen();
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+
+        // Every one of these is malformed or not decisive; none may settle the send or abort the loop.
+        expect(() =>
+            msgUpdate(state, 0, [
+                null,
+                undefined,
+                42,
+                'MSGID1',
+                {},
+                { key: null },
+                { key: {} },
+                { key: { id: null }, update: { status: 2 } },
+                { key: { id: '' }, update: { status: 2 } },
+                { key: { id: 'MSGID1' } },
+                { key: { id: 'MSGID1' }, update: null },
+                { key: { id: 'MSGID1' }, update: {} },
+                { key: { id: 'MSGID1' }, update: { status: 1 } },
+            ]),
+        ).not.toThrow();
+        await flush();
+        expect(send.done).toBe(false);
+
+        msgUpdate(state, 0, [null, { key: { id: 'MSGID1' }, update: { status: 2 } }]); // garbage FIRST, then the real one
+        await flush();
+        expect(send.value).toBe(true);
+    });
+
+    it.each<[string, unknown]>([
+        ['undefined', undefined],
+        ['null', null],
+        ['an empty object', {}],
+        ['a node with undefined attrs', { attrs: undefined }],
+        ['a node with empty attrs', { attrs: {} }],
+        ['a node with an empty id', { attrs: { id: '' } }],
+        ['an error ack with no id at all', { attrs: { error: '403' } }],
+    ])('3.11 a server ack node that is %s is ignored without throwing', async (_label, node) => {
+        const { svc, state } = await loadOpen();
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+
+        expect(() => wsEmit(state, 0, WA_ACK_EVENT, node)).not.toThrow();
+        await flush();
+
+        expect(send.done).toBe(false);
+        serverAck(state, 0, { id: 'MSGID1' });
+        await flush();
+        expect(send.value).toBe(true);
+    });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Spec 3.12 - group vs direct jid
+// ---------------------------------------------------------------------------------------------
+
+describe('spec 3.12: group and direct chats', () => {
+    it('3.12 a GROUP send confirms on the server ack ALONE: no messages.update is ever fired', async () => {
+        // messages.update never carries a positive status for a group (Baileys routes group receipts
+        // to message-receipt.update). The plan's original wording, "SERVER_ACK on messages.update",
+        // would have reported false for every group send forever. Nothing here fires one.
+        const { svc, state } = await loadOpen();
+        state.sockSend.mockResolvedValue(sentKey('MSGID1', GROUP));
+        // Make "no messages.update was fired" a machine-checked fact of this test, not a reviewer's
+        // memory: route the live messages.update listener through a spy that must stay untouched.
+        const updateListeners = state.sockets[0].handlers['messages.update'];
+        const messagesUpdateSpy = jest.fn(updateListeners[0]);
+        updateListeners[0] = messagesUpdateSpy;
+
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+        expect(send.done).toBe(false);
+
+        serverAck(state, 0, { id: 'MSGID1', from: GROUP });
+        await flush();
+
+        expect(messagesUpdateSpy).not.toHaveBeenCalled(); // the ack alone did it
+        expect(send.value).toBe(true);
+        expect(state.sockSend).toHaveBeenCalledWith(GROUP, { text: 'hello', linkPreview: null });
+        expect(logged(logSpy, '[WA:send] Acknowledged id=MSGID1 (server ack).')).toBe(true);
+        expect(logged(logSpy, `[WA:send] WhatsApp accepted the message to ${GROUP} (id=MSGID1).`)).toBe(true);
+        expect(jest.getTimerCount()).toBe(0);
+    });
+
+    it('3.12 the one thing messages.update can say about a group is a failure: status 0 rejects the send', async () => {
+        const { svc, state } = await loadOpen();
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+
+        // The one thing messages.update can legitimately tell us about a group: a bad ack.
+        msgUpdate(state, 0, [{ key: { id: 'MSGID1', remoteJid: GROUP, fromMe: true }, update: { status: 0 } }]);
+        await flush();
+
+        expect(send.value).toBe(false);
+    });
+
+    it('3.12 DIRECT chat: the server ack alone confirms', async () => {
+        const { svc, state } = await loadOpen();
+        state.sockSend.mockResolvedValue(sentKey('MSGID1', DIRECT));
+        const send = track(svc.sendMessage(DIRECT, 'hello'));
+        await flush();
+
+        serverAck(state, 0, { id: 'MSGID1', from: DIRECT });
+        await flush();
+
+        expect(send.value).toBe(true);
+    });
+
+    it('3.12 DIRECT chat: messages.update status 3 (DELIVERY_ACK, above the threshold) alone confirms', async () => {
+        const { svc, state } = await loadOpen();
+        state.sockSend.mockResolvedValue(sentKey('MSGID1', DIRECT));
+        const send = track(svc.sendMessage(DIRECT, 'hello'));
+        await flush();
+
+        msgUpdate(state, 0, [{ key: { id: 'MSGID1', remoteJid: DIRECT, fromMe: true }, update: { status: 3 } }]);
+        await flush();
+
+        expect(send.value).toBe(true);
+        expect(logged(logSpy, '[WA:send] Acknowledged id=MSGID1 (status=3).')).toBe(true);
+    });
+
+    it.each<[string, Record<string, string | undefined>]>([
+        ['an LID-form from', { from: '184467440737095@lid' }],
+        ['a different chat jid', { from: '120363999999999999@g.us' }],
+        ['no from at all', { from: undefined }],
+    ])('3.12 matching is on the message id only: an ack with %s still confirms', async (_label, attrs) => {
+        const { svc, state } = await loadOpen();
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+
+        wsEmit(state, 0, WA_ACK_EVENT, { tag: 'ack', attrs: { id: 'MSGID1', class: 'message', ...attrs } });
+        await flush();
+
+        expect(send.value).toBe(true);
+    });
+
+    it('3.12 the service listens to exactly the signals it trusts: never the local echo, never a per-participant receipt', async () => {
+        // messages.upsert would be Baileys' own local echo (the July bug with a new name), and
+        // message-receipt.update is one participant's device (deliberately not subscribed).
+        const { state } = await loadOpen();
+
+        expect(Object.keys(state.sockets[0].everRegistered).sort()).toEqual([
+            'connection.update',
+            'creds.update',
+            'messages.update',
+        ]);
+        expect(Object.keys(state.sockets[0].wsEverRegistered)).toEqual([WA_ACK_EVENT]);
+        expect(state.sockets[0].wsEverRegistered[WA_ACK_EVENT]).toHaveLength(1);
+    });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Spec 3.13 - listener hygiene and the identity guard
+// ---------------------------------------------------------------------------------------------
+
+describe('spec 3.13: listener hygiene and the identity guard', () => {
+    /** Socket 0 dies, the reconnect timer opens socket 1 and it reaches 'open'. Returns the loaded service. */
+    async function reconnected() {
+        const loaded = await loadOpen();
+        conn(loaded.state, 0, closeWith(408));
+        await advance(LADDER_MS[0]);
+        expect(loaded.state.sockets).toHaveLength(2);
+        conn(loaded.state, 1, { connection: 'open' });
+        return loaded;
+    }
+
+    it('3.13 after a close, ws.off was called with the exact registered handler, and messages.update listeners were removed', async () => {
+        const { state } = await loadOpen();
+        const handler = state.sockets[0].wsEverRegistered[WA_ACK_EVENT][0];
+        expect(state.sockets[0].wsHandlers[WA_ACK_EVENT]).toEqual([handler]);
+
+        conn(state, 0, closeWith(408));
+
+        const { ws, ev } = state.sockets[0].sock;
+        expect(ws.off).toHaveBeenCalledTimes(1);
+        expect(ws.off).toHaveBeenCalledWith(WA_ACK_EVENT, handler);
+        expect(state.sockets[0].wsHandlers[WA_ACK_EVENT]).toBeUndefined();
+        expect(ev.removeAllListeners).toHaveBeenCalledWith('messages.update');
+        expect(ev.removeAllListeners).toHaveBeenCalledWith('connection.update');
+        expect(ev.removeAllListeners).toHaveBeenCalledWith('creds.update');
+        expect(state.sockets[0].handlers['messages.update']).toBeUndefined();
+    });
+
+    it('3.13 only OUR ack listener is removed: Baileys\' own handler on the same event survives, and removeAllListeners is never used on ws', async () => {
+        const { state } = await loadOpen();
+        const baileysOwn = jest.fn();
+        state.sockets[0].sock.ws.on(WA_ACK_EVENT, baileysOwn); // Baileys registers its bad-ack handler on the same event
+
+        conn(state, 0, closeWith(408));
+
+        expect(state.sockets[0].wsHandlers[WA_ACK_EVENT]).toEqual([baileysOwn]);
+        expect(state.sockets[0].sock.ws.removeAllListeners).not.toHaveBeenCalled();
+    });
+
+    it.each<[string, (loaded: Awaited<ReturnType<typeof loadOpen>>) => Promise<void>]>([
+        ['a close', async ({ state }) => conn(state, 0, closeWith(408))],
+        ['a 401 stand-down', async ({ state }) => conn(state, 0, closeWith(401))],
+        ['an admin logout', async ({ svc }) => void (await svc.logout())],
+        ['a SIGTERM shutdown', async () => signalHandlers.SIGTERM()],
+    ])('3.13 %s detaches the ack listener with the exact handler', async (_label, drop) => {
+        const loaded = await loadOpen();
+        const handler = loaded.state.sockets[0].wsEverRegistered[WA_ACK_EVENT][0];
+
+        await drop(loaded);
+        await flush();
+
+        expect(loaded.state.sockets[0].sock.ws.off).toHaveBeenCalledWith(WA_ACK_EVENT, handler);
+        expect(loaded.state.sockets[0].wsHandlers[WA_ACK_EVENT]).toBeUndefined();
+        expect(loaded.state.sockets[0].sock.ev.removeAllListeners).toHaveBeenCalledWith('messages.update');
+    });
+
+    it('3.13 the connect-watchdog teardown detaches the ack listener too', async () => {
+        const { state } = await loadPaired(); // never reaches open
+        const handler = state.sockets[0].wsEverRegistered[WA_ACK_EVENT][0];
+        expect(state.sockets[0].wsHandlers[WA_ACK_EVENT]).toEqual([handler]);
+
+        await advance(WATCHDOG_MS);
+
+        expect(state.sockets[0].sock.ws.off).toHaveBeenCalledWith(WA_ACK_EVENT, handler);
+        expect(state.sockets[0].wsHandlers[WA_ACK_EVENT]).toBeUndefined();
+        expect(state.sockets[0].sock.ev.removeAllListeners).toHaveBeenCalledWith('messages.update');
+    });
+
+    it('3.13 no listener accumulates across reconnects: every dead socket is bare, the live one has exactly one of each', async () => {
+        const { state } = await loadOpen();
+        for (let cycle = 0; cycle < 3; cycle++) {
+            conn(state, cycle, closeWith(408));
+            await advance(LADDER_MS[0]);
+            conn(state, cycle + 1, { connection: 'open' });
+        }
+
+        expect(state.sockets).toHaveLength(4);
+        for (let i = 0; i < 3; i++) {
+            expect(state.sockets[i].wsHandlers[WA_ACK_EVENT]).toBeUndefined();
+            expect(state.sockets[i].handlers['messages.update']).toBeUndefined();
+        }
+        expect(state.sockets[3].wsHandlers[WA_ACK_EVENT]).toHaveLength(1);
+        expect(state.sockets[3].handlers['messages.update']).toHaveLength(1);
+    });
+
+    it('3.13 events delivered to a SUPERSEDED socket change nothing: no send settles and no line is logged', async () => {
+        const { svc, state } = await reconnected();
+        state.sockSend.mockResolvedValue(sentKey('MSGID1'));
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+        expect(send.done).toBe(false);
+        const lines = totalSendLines();
+        const infoLines = logSpy.mock.calls.length;
+
+        lateServerAck(state, 0, { id: 'MSGID1' });
+        lateServerAck(state, 0, { id: 'MSGID1', error: '403' });
+        emitLate(state, 0, 'messages.update', [{ key: { id: 'MSGID1' }, update: { status: 3 } }]);
+        emitLate(state, 0, 'messages.update', [{ key: { id: 'MSGID1' }, update: { status: 0 } }]);
+        await flush();
+
+        expect(send.done).toBe(false);
+        expect(totalSendLines()).toBe(lines);
+        expect(logSpy.mock.calls.length).toBe(infoLines);
+
+        serverAck(state, 1, { id: 'MSGID1' }); // the CURRENT socket still works
+        await flush();
+        expect(send.value).toBe(true);
+    });
+
+    it('3.13 a superseded socket\'s late ack cannot be buffered either', async () => {
+        const { svc, state } = await reconnected();
+        const parked = parkSend(state, sentKey('MSGID1'));
+        const send = track(svc.sendMessage(GROUP, 'hello')); // in flight, so a live ack WOULD be buffered
+        await flush();
+
+        lateServerAck(state, 0, { id: 'MSGID1' });
+        parked.release();
+        await flush();
+
+        expect(send.done).toBe(false); // not pre-confirmed by the dead socket's ack
+        await advance(ACK_TIMEOUT_MS);
+        expect(send.value).toBe(false);
+    });
+
+    it('3.13 a socket that exposes no ws emitter is reported loudly and never throws: a group send can only time out, a direct one still confirms on status', async () => {
+        const { svc, state } = await loadOpen();
+        const build = state.makeWASocket.getMockImplementation() as (options: Record<string, unknown>) => { ws?: unknown };
+        state.makeWASocket.mockImplementation((options: Record<string, unknown>) => {
+            const built = build(options);
+            built.ws = undefined; // Baileys always has one; this pins the defensive branch
+            return built;
+        });
+        conn(state, 0, closeWith(408));
+
+        await advance(LADDER_MS[0]);
+        conn(state, 1, { connection: 'open' });
+
+        expect(errorSpy).toHaveBeenCalledWith(
+            '[WA:send] Socket exposes no ws emitter; server acks cannot be observed and every send will report as unconfirmed.',
+        );
+        const group = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+        await advance(ACK_TIMEOUT_MS);
+        expect(group.value).toBe(false); // never true without evidence
+
+        state.sockSend.mockResolvedValue(sentKey('MSGID2', DIRECT));
+        const direct = track(svc.sendMessage(DIRECT, 'hello'));
+        await flush();
+        msgUpdate(state, 1, [{ key: { id: 'MSGID2' }, update: { status: 3 } }]);
+        await flush();
+        expect(direct.value).toBe(true);
+
+        expect(() => conn(state, 1, closeWith(408))).not.toThrow(); // detach copes with no handler to remove
+    });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Spec 3.14 - sock.sendMessage() resolves with no usable key
+// ---------------------------------------------------------------------------------------------
+
+describe('spec 3.14: no usable message key', () => {
+    it.each<[string, unknown]>([
+        ['undefined', undefined],
+        ['null', null],
+        ['an empty object', {}],
+        ['a key with no id', { key: {} }],
+        ['a key with a null id', { key: { id: null } }],
+        ['a key with an empty id', { key: { id: '' } }],
+    ])('3.14 sock.sendMessage() resolving %s is a loud false, arms no ack timer, and leaves nothing behind', async (_label, resolved) => {
+        const { svc, state } = await loadOpen();
+        state.sockSend.mockResolvedValue(resolved);
+
+        const result = await svc.sendMessage(GROUP, 'hello');
+
+        expect(result).toBe(false);
+        expect(logged(errorSpy, `[WA:send] sock.sendMessage() returned no message key for ${GROUP}; delivery cannot be confirmed. Recording as not sent.`)).toBe(true);
+        expect(jest.getTimerCount()).toBe(0); // the relay timer was cleared and no ack timer was ever armed
+        await expectStrayAckIsDropped(svc, state); // and the in-flight count came back to zero
+    });
+
+    it('3.14 the harness default (a socket that resolves undefined) is this case', async () => {
+        const { svc, state } = await loadPaired();
+        conn(state, 0, { connection: 'open' });
+
+        expect(await svc.sendMessage(GROUP, 'hello')).toBe(false);
+        expect(logged(errorSpy, 'returned no message key')).toBe(true);
+    });
+
+    it('3.14 a resolved relay is never taken as success on its own: no ack, no true', async () => {
+        const { svc, state } = await loadOpen();
+        state.sockSend.mockResolvedValue({ status: 2, ack: 3, key: {} }); // looks acknowledged, has no id
+
+        expect(await svc.sendMessage(GROUP, 'hello')).toBe(false);
+    });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Spec 3.15 - sock.sendMessage() rejects, and the relay deadline
+// ---------------------------------------------------------------------------------------------
+
+describe('spec 3.15: sock.sendMessage() rejects, and the relay deadline', () => {
+    it('3.15 a Boom "Connection Closed" (428) rejection: false, exactly one error log, no timer left', async () => {
+        const { svc, state } = await loadOpen();
+        const boom = connectionClosedBoom();
+        state.sockSend.mockRejectedValue(boom); // sock.sendMessage() is async: it rejects, it never throws synchronously
+
+        const result = await svc.sendMessage(GROUP, 'hello');
+
+        expect(result).toBe(false);
+        expect(errorSpy).toHaveBeenCalledWith(`[WA:send] sock.sendMessage() failed for ${GROUP}:`, boom);
+        expect(sendLines(errorSpy)).toHaveLength(1);
+        expect(jest.getTimerCount()).toBe(0);
+        await expectStrayAckIsDropped(svc, state);
+    });
+
+    it('3.15 a plain TypeError (the malformed-jid path inside relayMessage): false, and it never escapes as a rejection', async () => {
+        const { svc, state } = await loadOpen();
+        const typeError = new TypeError("Cannot destructure property 'user' of 'jidDecode(...)' as it is undefined.");
+        state.sockSend.mockRejectedValue(typeError);
+
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+
+        expect(send.error).toBeUndefined();
+        expect(send.value).toBe(false);
+        expect(errorSpy).toHaveBeenCalledWith(`[WA:send] sock.sendMessage() failed for ${GROUP}:`, typeError);
+    });
+
+    it('3.15 a relay that never settles is abandoned at exactly the relay deadline: false', async () => {
+        const { svc, state } = await loadOpen();
+        parkSend(state, sentKey('MSGID1'));
+
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+        await advance(RELAY_TIMEOUT_MS - 1);
+        expect(send.done).toBe(false);
+        await advance(1);
+
+        expect(send.value).toBe(false);
+        expect(errorSpy).toHaveBeenCalledWith(
+            `[WA:send] sock.sendMessage() failed for ${GROUP}:`,
+            expect.objectContaining({ message: `sock.sendMessage() did not settle within ${RELAY_TIMEOUT_MS}ms` }),
+        );
+        expect(jest.getTimerCount()).toBe(0); // no ack timer: the send never got an id
+        await expectStrayAckIsDropped(svc, state);
+    });
+
+    it('3.15 if the abandoned relay later succeeds, an operator is told, and the return value stays false', async () => {
+        const { svc, state } = await loadOpen();
+        const parked = parkSend(state, sentKey('MSGID1'));
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+        await advance(RELAY_TIMEOUT_MS);
+        expect(send.value).toBe(false);
+
+        parked.release();
+        await flush();
+
+        expect(logged(errorSpy, `[WA:send] A send to ${GROUP} completed AFTER its ${RELAY_TIMEOUT_MS}ms deadline (id=MSGID1). It is recorded as NOT sent; the group may show it.`)).toBe(true);
+        expect(send.value).toBe(false);
+        expect(jest.getTimerCount()).toBe(0); // and it did not start an ack wait for a send already reported
+    });
+
+    it('3.15 a late success that carries no id is reported as id=unknown', async () => {
+        const { svc, state } = await loadOpen();
+        const parked = parkSend(state, undefined);
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+        await advance(RELAY_TIMEOUT_MS);
+        expect(send.value).toBe(false);
+
+        parked.release();
+        await flush();
+
+        expect(logged(errorSpy, '(id=unknown)')).toBe(true);
+    });
+
+    it('3.15 if the abandoned relay later REJECTS it is handled and logged (it cannot become an unhandledRejection)', async () => {
+        const { svc, state } = await loadOpen();
+        const parked = parkSend(state, sentKey('MSGID1'));
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+        await advance(RELAY_TIMEOUT_MS);
+        expect(send.value).toBe(false);
+
+        parked.fail(new Error('late boom'));
+        await flush();
+
+        expect(warnSpy).toHaveBeenCalledWith(`[WA:send] The abandoned send to ${GROUP} later failed:`, expect.objectContaining({ message: 'late boom' }));
+        expect(send.value).toBe(false);
+    });
+
+    it.each(['not-a-jid', '', '120363000000000000'])('3.15 a malformed chat id %j (no "@") returns false WITHOUT calling sock.sendMessage', async (chatId) => {
+        const { svc, state } = await loadOpen();
+
+        const result = await svc.sendMessage(chatId, 'hello');
+
+        expect(result).toBe(false);
+        expect(state.sockSend).not.toHaveBeenCalled();
+        expect(logged(errorSpy, `[WA:send] Refusing to send: "${chatId}" is not a WhatsApp jid (expected user@s.whatsapp.net or id@g.us).`)).toBe(true);
+        expect(jest.getTimerCount()).toBe(0);
+        await expectStrayAckIsDropped(svc, state);
+    });
+
+    it('3.15 the routes\' own inputs are accepted: a group jid and a direct jid both reach the socket', async () => {
+        const { svc, state } = await loadOpen();
+        const g = track(svc.sendMessage(GROUP, 'hello'));
+        const d = track(svc.sendMessage(DIRECT, 'hello'));
+        await flush();
+
+        expect(state.sockSend.mock.calls.map((call) => call[0])).toEqual([GROUP, DIRECT]);
+        expect(g.done).toBe(false);
+        expect(d.done).toBe(false);
+    });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Spec 3.16 - env overrides and content shape
+// ---------------------------------------------------------------------------------------------
+
+describe('spec 3.16: env overrides and content shape', () => {
+    it('3.16 WA_ACK_TIMEOUT_MS=1000 is honoured', async () => {
+        const { svc } = await loadOpen({ env: { WA_ACK_TIMEOUT_MS: '1000' } });
+
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+        await advance(999);
+        expect(send.done).toBe(false);
+        await advance(1);
+
+        expect(send.value).toBe(false);
+        expect(logged(errorSpy, `[WA:send] No acknowledgement from WhatsApp for ${GROUP} (id=MSGID1) within 1000ms.`)).toBe(true);
+    });
+
+    it.each(['0', 'abc', ''])('3.16 WA_ACK_TIMEOUT_MS=%j falls back to 20 000, not to an instant timeout', async (value) => {
+        const { svc } = await loadOpen({ env: { WA_ACK_TIMEOUT_MS: value } });
+
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+        await advance(ACK_TIMEOUT_MS - 1);
+        expect(send.done).toBe(false);
+        await advance(1);
+
+        expect(send.value).toBe(false);
+        expect(logged(errorSpy, `within ${ACK_TIMEOUT_MS}ms.`)).toBe(true);
+    });
+
+    it('3.16 WA_SEND_RELAY_TIMEOUT_MS=1000 is honoured', async () => {
+        const { svc, state } = await loadOpen({ env: { WA_SEND_RELAY_TIMEOUT_MS: '1000' } });
+        parkSend(state, sentKey('MSGID1'));
+
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+        await advance(999);
+        expect(send.done).toBe(false);
+        await advance(1);
+
+        expect(send.value).toBe(false);
+        expect(errorSpy).toHaveBeenCalledWith(
+            `[WA:send] sock.sendMessage() failed for ${GROUP}:`,
+            expect.objectContaining({ message: 'sock.sendMessage() did not settle within 1000ms' }),
+        );
+    });
+
+    it.each(['0', 'abc', ''])('3.16 WA_SEND_RELAY_TIMEOUT_MS=%j falls back to 10 000, not to an instant failure', async (value) => {
+        const { svc, state } = await loadOpen({ env: { WA_SEND_RELAY_TIMEOUT_MS: value } });
+        parkSend(state, sentKey('MSGID1'));
+
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+        await advance(RELAY_TIMEOUT_MS - 1);
+        expect(send.done).toBe(false);
+        await advance(1);
+
+        expect(send.value).toBe(false);
+        expect(errorSpy).toHaveBeenCalledWith(
+            `[WA:send] sock.sendMessage() failed for ${GROUP}:`,
+            expect.objectContaining({ message: `sock.sendMessage() did not settle within ${RELAY_TIMEOUT_MS}ms` }),
+        );
+    });
+
+    it('3.16 the two overrides are independent: a short ack budget does not shorten the relay deadline', async () => {
+        const { svc, state } = await loadOpen({ env: { WA_ACK_TIMEOUT_MS: '1000' } });
+        const parked = parkSend(state, sentKey('MSGID1'));
+
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+        await advance(RELAY_TIMEOUT_MS - 1); // far beyond the 1 s ack budget, but the relay has 10 s
+        expect(send.done).toBe(false);
+
+        parked.release();
+        await flush();
+        expect(send.done).toBe(false); // now the 1 s ack budget starts
+        await advance(1000);
+        expect(send.value).toBe(false);
+    });
+
+    it('3.16 env from an earlier test does not leak: a fresh load sees the defaults again', async () => {
+        expect(process.env.WA_ACK_TIMEOUT_MS).toBeUndefined();
+        expect(process.env.WA_SEND_RELAY_TIMEOUT_MS).toBeUndefined();
+
+        const { svc } = await loadOpen();
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+        await advance(ACK_TIMEOUT_MS - 1);
+        expect(send.done).toBe(false);
+        await advance(1);
+        expect(send.value).toBe(false);
+    });
+
+    it('3.16 sock.sendMessage() is called with exactly (chatId, { text, linkPreview: null }): a URL in a prayer must not make the box fetch it', async () => {
+        const { svc, state } = await loadOpen();
+        const message = '🙏 *New Anonymous Request:* please pray, see https://example.com/some/page?x=1';
+
+        const send = track(svc.sendMessage(GROUP, message));
+        await flush();
+
+        expect(state.sockSend).toHaveBeenCalledTimes(1);
+        expect(state.sockSend).toHaveBeenCalledWith(GROUP, { text: message, linkPreview: null });
+        const [chat, content] = state.sockSend.mock.calls[0] as [string, Record<string, unknown>];
+        expect(state.sockSend.mock.calls[0]).toHaveLength(2); // no third "options" argument
+        expect(chat).toBe(GROUP);
+        expect(content.linkPreview).toBeNull(); // null, not undefined and not false: undefined is what triggers the fetch
+        expect(Object.keys(content).sort()).toEqual(['linkPreview', 'text']); // nothing else rides along
+        expect(content.text).toBe(message); // verbatim: not trimmed, not re-encoded
+
+        serverAck(state, 0, { id: 'MSGID1' });
+        await flush();
+        expect(send.value).toBe(true);
+    });
+
+    it('3.16 the content shape is the same for a direct chat and for text with newlines', async () => {
+        const { svc, state } = await loadOpen();
+        const message = 'line one\nline two\n\nhttp://plain.example/';
+
+        void svc.sendMessage(DIRECT, message);
+        await flush();
+
+        expect(state.sockSend).toHaveBeenCalledWith(DIRECT, { text: message, linkPreview: null });
+    });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Frozen facade: sendMessage()
+// ---------------------------------------------------------------------------------------------
+
+describe('frozen facade: sendMessage()', () => {
+    it('is a two-argument method that always returns a Promise', async () => {
+        const { svc, state } = await loadOpen();
+
+        expect(svc.sendMessage.length).toBe(2);
+        const accepted = svc.sendMessage(GROUP, 'hello');
+        expect(accepted).toBeInstanceOf(Promise);
+        await flush();
+        serverAck(state, 0, { id: 'MSGID1' });
+        await flush();
+        expect(await accepted).toBe(true);
+
+        conn(state, 0, closeWith(401));
+        const notConnected = svc.sendMessage(GROUP, 'hello');
+        expect(notConnected).toBeInstanceOf(Promise);
+        expect(await notConnected).toBe(false);
+    });
+
+    it('resolves the boolean true ONLY on a real acceptance, never a truthy object (the routes test `!sent`)', async () => {
+        // api/submit and api/admin/prayers/resend write whatsappSent = true whenever the result is
+        // truthy. The relay returning a (truthy) WAMessage must therefore never leak out as the result.
+        const { svc, state } = await loadOpen();
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+        expect(send.done).toBe(false); // the relay resolved with a truthy object and nothing was returned
+
+        serverAck(state, 0, { id: 'MSGID1' });
+        await flush();
+
+        expect(send.value).toBe(true);
+        expect(typeof send.value).toBe('boolean');
+    });
+
+    it.each<[string, (state: MockState) => void, (state: MockState) => Promise<void>]>([
+        [
+            'sock.sendMessage() rejecting',
+            (state) => void state.sockSend.mockRejectedValue(connectionClosedBoom()),
+            async () => undefined,
+        ],
+        [
+            'sock.sendMessage() resolving no key',
+            (state) => void state.sockSend.mockResolvedValue(undefined),
+            async () => undefined,
+        ],
+        [
+            'a server ack carrying an error',
+            () => undefined,
+            async (state) => serverAck(state, 0, { id: 'MSGID1', error: '403' }),
+        ],
+        ['an ack timeout', () => undefined, async () => advance(ACK_TIMEOUT_MS)],
+    ])('every failure resolves the boolean false and never rejects: %s', async (_label, arrange, act) => {
+        const { svc, state } = await loadOpen();
+        arrange(state);
+
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+        await act(state);
+        await flush();
+
+        expect(send.error).toBeUndefined(); // a rejection would 500 a submission whose row is already written
+        expect(send.value).toBe(false); // strictly false: not undefined, not null, not an object
+    });
+
+    it('getStatus() gains no field from S3', async () => {
+        const { svc, state } = await loadOpen();
+        void svc.sendMessage(GROUP, 'hello');
+        await flush();
+        serverAck(state, 0, { id: 'MSGID1' });
+        await flush();
+
+        expect(Object.keys(svc.getStatus()).sort()).toEqual(
+            ['connected', 'consecutiveInitFailures', 'hasQr', 'initializing', 'nextInitAllowedAt'],
+        );
     });
 });
