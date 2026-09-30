@@ -40,18 +40,31 @@ steps:
       - |
         # Securely copy the Compose file to the VM's /tmp directory
         gcloud compute scp docker-compose.prod.yml deploy-user@${_VM_NAME}:/tmp/docker-compose.prod.yml --zone=${_VM_ZONE} --quiet
+
+        # ...and the nginx config, which was NEVER copied before. docker-compose.prod.yml
+        # bind-mounts ./nginx/conf.d into the nginx container, but only the compose file
+        # itself was ever deployed, so that directory was hand-maintained on the VM and
+        # the repo was not really the source of truth for it. The two happened to be
+        # byte-identical as of 2026-09-30, but any nginx change committed here would
+        # silently never have reached production - which is exactly what would have
+        # happened to the proxy_read_timeout this migration needs.
+        gcloud compute scp nginx/conf.d/default.conf deploy-user@${_VM_NAME}:/tmp/nginx-default.conf --zone=${_VM_ZONE} --quiet
         
         # SSH in to move the files, pull the new images, and restart the containers
         gcloud compute ssh deploy-user@${_VM_NAME} --zone=${_VM_ZONE} --quiet --command="sudo bash -c '\
-          mkdir -p /var/intercessor/app && \
+          mkdir -p /var/intercessor/app/nginx/conf.d && \
           cp /tmp/docker-compose.prod.yml /var/intercessor/app/ && \
+          cp /tmp/nginx-default.conf /var/intercessor/app/nginx/conf.d/default.conf && \
+          chmod 644 /var/intercessor/app/nginx/conf.d/default.conf && \
+          if docker ps --format {{.Names}} | grep -qx prayer-wall-nginx-prod; then docker exec prayer-wall-nginx-prod nginx -t; fi && \
           cd /var/intercessor/app && \
           gcloud auth configure-docker ${_ARTIFACT_REGION}-docker.pkg.dev --quiet && \
           export PROJECT_ID=$PROJECT_ID && \
           docker-compose -f docker-compose.prod.yml pull && \
           docker-compose -f docker-compose.prod.yml stop app && \
           docker-compose -f docker-compose.prod.yml rm -f app && \
-          docker-compose -f docker-compose.prod.yml up -d'"
+          docker-compose -f docker-compose.prod.yml up -d && \
+          docker exec prayer-wall-nginx-prod nginx -s reload'"
 
         # Remove stale deploy-user ephemeral keys from project metadata to prevent accumulation
         current_keys=$(gcloud compute project-info describe --project=$PROJECT_ID --format="value(commonInstanceMetadata.items['ssh-keys'])")

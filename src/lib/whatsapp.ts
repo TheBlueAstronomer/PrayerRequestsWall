@@ -1,25 +1,22 @@
 import fs from 'fs';
 import path from 'path';
 
-import { Client, LocalAuth } from 'whatsapp-web.js';
+import type { ConnectionState, WASocket } from '@whiskeysockets/baileys';
+import pino from 'pino';
 
 /**
- * Delivery acknowledgement levels reported by WhatsApp for an outgoing message.
- * Mirrors whatsapp-web.js's MessageAck enum. Declared locally rather than
+ * Baileys disconnect status codes, mirroring DisconnectReason in
+ * @whiskeysockets/baileys (lib/Types/index.d.ts). Declared locally rather than
  * imported so the values stay available even when the library is mocked.
  */
-const ACK_ERROR = -1;
-const ACK_PENDING = 0;
-const ACK_SERVER = 1;
+const WA_LOGGED_OUT = 401;            // DisconnectReason.loggedOut
+const WA_FORBIDDEN = 403;             // DisconnectReason.forbidden
+const WA_MULTIDEVICE_MISMATCH = 411;  // DisconnectReason.multideviceMismatch
+const WA_CONNECTION_REPLACED = 440;   // DisconnectReason.connectionReplaced
+const WA_RESTART_REQUIRED = 515;      // DisconnectReason.restartRequired
 
-const DEFAULT_ACK_TIMEOUT_MS = 30000;
-const MAX_EARLY_ACKS = 200;
-
-/** How many unscanned QR codes to offer before giving up and releasing Chromium. */
-const QR_MAX_RETRIES = Number(process.env.WA_QR_MAX_RETRIES) || 5;
-
-/** Emitted by whatsapp-web.js as the disconnect reason once qrMaxRetries is hit. */
-const MAX_QR_RETRIES_REASON = 'max qrcode retries';
+/** Close codes that mean the session is gone and a human must re-scan. */
+const SESSION_LOST_CODES = new Set([WA_LOGGED_OUT, WA_FORBIDDEN, WA_MULTIDEVICE_MISMATCH]);
 
 /**
  * Stable event token for the "session lost, a human must re-scan the QR" alert.
@@ -33,27 +30,126 @@ const SESSION_LOST_EVENT = 'wa_session_lost';
 /**
  * Backoff ladder for consecutive failed initialize() attempts, in ms. The Nth
  * consecutive failure blocks the next non-forced attempt for INIT_BACKOFF_MS[N-1];
- * the last value repeats. Before this existed, a failing client was relaunched
- * every 5s for as long as an admin page was open, leaking a Chromium per attempt.
+ * the last value repeats.
  */
 const INIT_BACKOFF_MS = [5_000, 15_000, 60_000, 300_000, 900_000];
 
-/**
- * Ceiling on client.destroy() when discarding a dead client. destroy() drives a
- * browser that may already be wedged; unbounded, cleanup becomes the new hang.
- */
-const DESTROY_TIMEOUT_MS = 15_000;
+/** Auth directory default. Overridable by WA_AUTH_PATH. */
+const DEFAULT_AUTH_DIR = '/app/.baileys_auth';
 
 /**
- * Stable event token for "teardown of a discarded client's browser failed or timed
- * out". Mirrors SESSION_LOST_EVENT's contract — a Cloud Logging metric can match
- * this exact string — so a Chromium orphan is alertable as soon as cleanup starts
- * failing, rather than only once it shows up as memory pressure.
+ * How long a socket may sit in 'connecting' before we declare it dead. Baileys'
+ * own connectTimeoutMs covers the TCP/noise handshake only; a socket that
+ * completes the handshake and then goes silent emits nothing at all. This is the
+ * Baileys equivalent of the pupBrowser disconnect watcher — without it, a dead
+ * socket leaves isInitializing latched forever and a loud outage becomes a silent one.
  */
-const CLEANUP_FAILED_EVENT = 'wa_cleanup_failed';
+const CONNECT_WATCHDOG_MS = 90_000;
 
-/** Minimal shape of the Message returned by client.sendMessage(). */
-type SentMessage = { id?: { _serialized?: string }; ack?: number };
+/** Ceiling on sock.logout()/sock.end() so an admin Logout can never 504 at nginx (62s). */
+const SOCKET_END_TIMEOUT_MS = 5_000;
+
+/** Device label shown in the phone's Linked Devices list. */
+const WA_BROWSER: [string, string, string] = ['TribePrayer', 'Chrome', '1.0.0'];
+
+/**
+ * proto.WebMessageInfo.Status, mirrored from @whiskeysockets/baileys
+ * (WAProto/WAProto.proto:5240-5247, re-exported as WAMessageStatus in
+ * lib/Types/Message.d.ts:32). Declared locally rather than imported so the values
+ * stay available even when the library is mocked — same reasoning as the WA_* close
+ * codes above.
+ *
+ * NOTE THE TRAP: ERROR is 0, not -1. whatsapp-web.js used -1, so the old code could
+ * get away with truthiness; here a falsy check would silently swallow the one status
+ * that means "WhatsApp rejected this". Compare explicitly, never with `!status`.
+ */
+const WA_STATUS_ERROR = 0;
+/* eslint-disable @typescript-eslint/no-unused-vars -- the full enum is mirrored for the reader; only ERROR and the SERVER_ACK threshold are compared, and PENDING (1) is the local pre-send state, deliberately not decisive. */
+const WA_STATUS_PENDING = 1;
+const WA_STATUS_SERVER_ACK = 2;   // the acceptance threshold
+const WA_STATUS_DELIVERY_ACK = 3;
+const WA_STATUS_READ = 4;
+const WA_STATUS_PLAYED = 5;
+/* eslint-enable @typescript-eslint/no-unused-vars */
+
+/**
+ * Raw-frame event for the server's acknowledgement of one of our outbound message
+ * stanzas. Baileys dispatches `CB:<tag>,<attr>:<value>` for every received binary node
+ * (lib/Socket/socket.js:458-462) and subscribes to this exact string itself for its
+ * bad-ack handler (lib/Socket/messages-recv.js:1624). This is the ONLY positive
+ * "WhatsApp accepted it" signal that exists for a group send: for a group jid,
+ * messages.update never carries a status (handleReceipt routes group receipts to
+ * message-receipt.update instead).
+ */
+const WA_ACK_EVENT = 'CB:ack,class:message';
+
+/**
+ * How long to wait for a decisive ack after the message id is known.
+ * 20s, down from master's 30s: api/submit awaits sendMessage() once per configured
+ * group, serially, inside one HTTP request that nginx abandons at 62s. The worst case
+ * must stay under that for a realistic group count, so the budget is
+ * (relay 10s + ack 20s) x 2 groups = 60s. Baileys acks a healthy send in well under a
+ * second; 20s is already ~20x headroom. Overridable by WA_ACK_TIMEOUT_MS (the same name
+ * master used, so an existing deployment override keeps working).
+ */
+const DEFAULT_ACK_TIMEOUT_MS = 20_000;
+
+/**
+ * Ceiling on sock.sendMessage() itself. Unbounded, it is not: a group send whose
+ * metadata is not cached issues an iq query through query() -> waitForMessage(), whose
+ * default timeout is defaultQueryTimeoutMs = 60_000 (lib/Defaults/index.js:56). One
+ * such send plus the ack wait would exceed nginx's 62s and 504 a submission whose DB row
+ * was already written. Overridable by WA_SEND_RELAY_TIMEOUT_MS.
+ */
+const DEFAULT_RELAY_TIMEOUT_MS = 10_000;
+
+/**
+ * Outcomes that arrived before sendMessage() had registered its waiter. Bounded,
+ * because an unbounded cache on a long-lived singleton is a slow memory leak, and this
+ * box has already died twice of resource exhaustion. Same bound and FIFO eviction as
+ * master's earlyAcks.
+ */
+const MAX_EARLY_ACKS = 200;
+
+/**
+ * Hard cap on concurrent ack waiters. Each entry lives at most WA_ACK_TIMEOUT_MS and is
+ * removed by its own settle, so this is a backstop against a wedged settle path rather
+ * than an expected limit; a prayer wall does not get 100 simultaneous submissions, and if
+ * it does, shedding load on a 2 GB box is the right answer.
+ */
+const MAX_PENDING_SENDS = 100;
+
+/**
+ * Floor between two send-triggered re-arms. Distinct from the failure ladder because a
+ * send-driven re-arm is not a failure and must not show up in getStatus()'s
+ * nextInitAllowedAt, which the admin UI renders. See rearmAfterDisconnectedSend().
+ */
+const SEND_REARM_MIN_INTERVAL_MS = 60_000;
+
+/** Minimal shape of a Baileys close error (a @hapi/boom instance at runtime). */
+type DisconnectError = Error & { output?: { statusCode?: number } };
+
+/** Minimal shape of the WAMessage returned by sock.sendMessage(). */
+type SentMessage = { key?: { id?: string | null } };
+
+/** Minimal shape of a `CB:ack,class:message` binary node. */
+type AckNode = { attrs?: Record<string, string | undefined> };
+
+/** Minimal shape of one element of a messages.update payload. */
+type MessageStatusUpdate = {
+    key?: { id?: string | null };
+    update?: { status?: number | string | null };
+};
+
+/**
+ * Why a send stopped waiting.
+ *  accepted  - WhatsApp acked the exact message id, or reported status >= SERVER_ACK.
+ *  rejected  - WhatsApp reported an error for that id (bad ack attr, or status ERROR).
+ *  timeout   - nothing decisive arrived within the ack budget.
+ *  abandoned - the socket went away (close, watchdog, logout, shutdown).
+ * Only 'accepted' maps to sendMessage() returning true.
+ */
+type SendOutcome = 'accepted' | 'rejected' | 'timeout' | 'abandoned';
 
 /** Non-mutating snapshot of the client lifecycle, for routes that must report. */
 export type WhatsAppStatus = {
@@ -66,246 +162,683 @@ export type WhatsAppStatus = {
 };
 
 class WhatsAppService {
-    public client: Client;
-    private isReady: boolean = false;
     public latestQR: string | null = null;
+
+    /** The live socket, or null when none is open. Replaces `public client`. */
+    private sock: WASocket | null = null;
+
+    private isReady: boolean = false;
     private isShuttingDown: boolean = false;
+
+    /**
+     * True from the moment initialize() commits to opening a socket until that
+     * socket reaches 'open', dies, or the watchdog fires. Doubles as the
+     * re-entrancy guard (see initialize()'s doc). One latch, not two: the
+     * initInFlight/isInitializing pair existed only to stop two Chromiums
+     * launching against one profile.
+     */
     private isInitializing: boolean = false;
 
     /**
-     * True for the exact span of one client.initialize() call. isInitializing is a
-     * coarser "a browser is running" latch that AUTHENTICATION_FAILURE and
-     * disconnected handlers can clear from *inside* that call (both are wired up
-     * during inject(), which client.initialize() awaits) — if a Reconnect or
-     * sendMessage() re-entered on that window, it would call client.initialize()
-     * a second time on the same live Client. This flag is set only around the
-     * await itself and cannot be cleared by an event handler, so the re-entry
-     * window is fully closed regardless of what fires mid-launch.
+     * Was this socket's auth state already registered when we opened it? Captured
+     * at socket creation, because on close we must distinguish "a paired session
+     * dropped, reconnect" from "nobody scanned the QR, stand down".
      */
-    private initInFlight: boolean = false;
+    private wasRegistered: boolean = false;
 
     /**
-     * The browser-crash watcher registered in initialize() (F1), plus the browser
-     * it's attached to, so it can be explicitly detached. It lives on the
-     * Puppeteer Browser EventEmitter, not the Client EventEmitter, so
-     * dead.removeAllListeners() does NOT reach it on its own — every intentional
-     * teardown must disarm this via disarmBrowserWatch() or the watcher survives
-     * the discard and fires a false wa_session_lost on the next browser close (B1).
-     * At most one is ever armed, matching every other piece of this-scoped client
-     * state (isReady, latestQR, …) that tracks the current client only.
+     * Set while an admin-initiated logout() is in flight, so the loggedOut close
+     * it causes is recognised as intentional and does NOT raise the session-lost
+     * alert. Consumed (reset) by logout() after the socket is detached.
      */
-    private browserWatch: { browser: NonNullable<Client['pupBrowser']>; handler: () => void } | null = null;
-
     /**
-     * Set while an admin-initiated logout() is in flight, so the LOGOUT
-     * `disconnected` event it causes is recognised as intentional and does NOT
-     * raise the session-lost alert. Consumed (reset) by that event.
+     * Bumped every time the credentials on disk are invalidated (see clearAuthDir()).
+     * openSocket() samples it before its awaits and re-checks after: a socket built
+     * from credentials that were wiped while it was being built is discarded rather
+     * than installed, no matter which concurrent launch happens to finish first.
+     * Without this the outcome depends on await-resolution order, and the losing
+     * ordering silently reconnects as the account the admin just logged out.
      */
+    private authEpoch: number = 0;
+
     private intentionalLogout: boolean = false;
 
-    /** Outgoing messages awaiting a server ack, keyed by serialized message id. */
-    private pendingAcks: Map<string, (ack: number) => void> = new Map();
+    /** At most one scheduled auto-reconnect is ever armed. This is the storm guard. */
+    private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
-    /**
-     * Acks that arrived before sendMessage() had registered its waiter. Bounded,
-     * because an unbounded cache on a long-lived singleton is a slow memory leak.
-     */
-    private earlyAcks: Map<string, number> = new Map();
+    /** Armed at socket creation, disarmed on 'open' or 'close'. See CONNECT_WATCHDOG_MS. */
+    private connectWatchdog: ReturnType<typeof setTimeout> | null = null;
 
-    private ackTimeoutMs: number = Number(process.env.WA_ACK_TIMEOUT_MS) || DEFAULT_ACK_TIMEOUT_MS;
-
-    /** Consecutive failed initialize() attempts. Reset only by a successful launch. */
+    /** Consecutive failed connection attempts. Reset only by a successful 'open'. */
     private consecutiveInitFailures: number = 0;
 
     /** Epoch ms before which a non-forced initialize() is refused. 0 = no backoff. */
     private nextInitAllowedAt: number = 0;
 
+    /**
+     * Outgoing messages awaiting a decisive outcome, keyed by Baileys message id
+     * (fullMsg.key.id). A map, not a field: two routes can send concurrently and
+     * api/submit loops over several groups. Bounded by MAX_PENDING_SENDS at the
+     * sendMessage() entry, and every entry is removed by its own settle() or by
+     * settleAllPendingSends().
+     */
+    private pendingSends: Map<string, (outcome: SendOutcome) => void> = new Map();
+
+    /**
+     * Outcomes that arrived before their waiter was registered — the early-ack race is
+     * real here: sock.sendMessage() only resolves after relayMessage() has awaited the
+     * ws write, and the server's ack can land on the socket while that continuation is
+     * still queued as a microtask. Bounded three ways: FIFO-evicted at MAX_EARLY_ACKS,
+     * only written while inFlightSends > 0, and cleared wholesale on every detach.
+     */
+    private earlyAcks: Map<string, SendOutcome> = new Map();
+
+    /**
+     * Sends between "about to call sock.sendMessage()" and "done with the ack wait".
+     * Gates earlyAcks: with no send in flight, an inbound ack for an id we are not
+     * waiting on is somebody else's business and is dropped rather than cached.
+     */
+    private inFlightSends: number = 0;
+
+    /**
+     * The `CB:ack,class:message` listener currently registered on this.sock.ws, kept so
+     * detachSocket() can remove exactly ours. sock.end() removes only ws's 'close',
+     * 'open' and 'message' listeners (lib/Socket/socket.js:481-483), so unlike the
+     * sock.ev listeners this one is NOT cleaned up by the library and would leak into
+     * `this` on every reconnect. removeAllListeners(WA_ACK_EVENT) is deliberately not
+     * used: Baileys registers its own bad-ack handler on the same event.
+     */
+    private ackHandler: ((node: unknown) => void) | null = null;
+
+    /** Epoch ms before which a send-triggered re-arm is suppressed. 0 = none. */
+    private nextSendRearmAllowedAt: number = 0;
+
+    /** Read once at construction so a test can set the env before importing. */
+    /**
+     * `|| DEFAULT` handles 0, '' and unparseable text. The Math.max floor handles the
+     * two remaining operator typos, which fail in the worst possible direction: a
+     * NEGATIVE value is truthy, so it survives the `||` and yields a timer that fires
+     * immediately — every send would report a timeout while messages arrived fine,
+     * which is indistinguishable from the July bug. (A value above 2^31-1 is clamped
+     * by Node to 1 ms, with the same effect.) One second is below any plausible real
+     * setting and above any value that breaks the feature.
+     */
+    private readonly ackTimeoutMs: number = Math.max(1_000, Number(process.env.WA_ACK_TIMEOUT_MS) || DEFAULT_ACK_TIMEOUT_MS);
+    private readonly relayTimeoutMs: number = Math.max(1_000, Number(process.env.WA_SEND_RELAY_TIMEOUT_MS) || DEFAULT_RELAY_TIMEOUT_MS);
+
+    /** Resolved once in the constructor so tests can set WA_AUTH_PATH before import. */
+    private readonly authDir: string;
+
+    /**
+     * Baileys 7 requires a real logger: passing `logger: undefined` overrides
+     * DEFAULT_CONNECTION_CONFIG's own and throws
+     * "Cannot read properties of undefined (reading 'child')" inside
+     * makeNoiseHandler (S1 finding 1). Level 'silent' because Baileys' debug
+     * output is very chatty and this container's stdout ships to Cloud Logging,
+     * which is billed.
+     */
+    private readonly logger = pino({ level: process.env.WA_LOG_LEVEL || 'silent' });
+
     constructor() {
         console.log('[WA:init] Constructing WhatsAppService singleton...');
 
-        this.client = this.createClient();
+        this.authDir = process.env.WA_AUTH_PATH || DEFAULT_AUTH_DIR;
 
         this.setupGracefulShutdown();
     }
 
-    private createClient(): Client {
-        console.log('[WA:init] Creating new Client instance...');
-
-        const client = new Client({
-            authStrategy: new LocalAuth({
-                dataPath: process.env.WA_DATA_PATH || './.wwebjs_auth',
-            }),
-            authTimeoutMs: 60000,
-            // Finite on purpose. 0 means *unlimited* in whatsapp-web.js: an
-            // unauthenticated client regenerates a QR every ~20s forever, and each
-            // cycle keeps Chromium resident. Left unbounded this pins the CPU and
-            // fills the disk. Give up instead, and re-arm on demand (see initialize()).
-            qrMaxRetries: QR_MAX_RETRIES,
-            puppeteer: {
-                handleSIGINT: false,
-                args: [
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-accelerated-2d-canvas',
-                    '--no-first-run',
-                    '--no-zygote',
-                    '--disable-gpu'
-                ],
-                protocolTimeout: 120000,
-            },
-        });
-
-        client.on('qr', (qr) => {
-            console.log(`[WA:qr] New QR code received (length: ${qr.length}). Awaiting scan.`);
-            this.latestQR = qr;
-        });
-
-        client.on('ready', () => {
-            console.log('[WA:ready] Client is ready. Session established.');
-            this.isReady = true;
-            this.latestQR = null;
-            this.isInitializing = false;
-        });
-
-        client.on('authenticated', () => {
-            console.log('[WA:auth] Authenticated successfully. Loading session...');
-            this.latestQR = null;
-        });
-
-        client.on('auth_failure', (msg) => {
-            console.error(`[WA:auth] Authentication failed: ${msg}`);
-            this.isInitializing = false;
-            // Auth failure is always involuntary — the session was rejected and a
-            // human must re-scan. Alert regardless of the intentional-logout flag.
-            this.emitSessionLostAlert(`auth_failure: ${msg}`);
-        });
-
-        client.on('disconnected', (reason) => {
-            console.warn(`[WA:disconnect] Client disconnected. Reason: ${reason}. isReady reset to false.`);
-            this.isReady = false;
-            this.isInitializing = false;
-            this.settleAllPendingAcks(ACK_PENDING);
-
-            const isLogout = String(reason).toUpperCase().includes('LOGOUT');
-            if (isLogout) {
-                if (this.intentionalLogout) {
-                    console.log('[WA:disconnect] Intentional admin logout — alert suppressed.');
-                } else {
-                    // Involuntary logout: the phone unlinked the device, or WhatsApp
-                    // forced it. The bot cannot send until someone re-scans the QR.
-                    this.emitSessionLostAlert(String(reason));
-                }
-                this.intentionalLogout = false; // one-shot; consume it
-            }
-
-            if (String(reason).toLowerCase().includes(MAX_QR_RETRIES_REASON)) {
-                // whatsapp-web.js has destroyed the client and released Chromium.
-                // Drop the expired QR and swap in a fresh, un-initialized client so
-                // the next initialize() starts cleanly rather than reusing a corpse.
-                console.warn(`[WA:qr] No scan after ${QR_MAX_RETRIES} QR codes. Released Chromium; will re-arm on the next initialize().`);
-                this.latestQR = null;
-                this.replaceClient();
-            }
-        });
-
-        client.on('message_ack', (msg: unknown, ack: number) => {
-            const id = (msg as SentMessage)?.id?._serialized;
-            if (!id) return;
-
-            // Intermediate acks (still queued) are not decisive — keep waiting.
-            if (ack !== ACK_ERROR && ack < ACK_SERVER) return;
-
-            const settle = this.pendingAcks.get(id);
-            if (settle) {
-                settle(ack);
-                return;
-            }
-
-            // The ack beat sendMessage()'s waiter registration — hold it so the
-            // waiter can pick it up instead of timing out on a delivered message.
-            if (this.earlyAcks.size >= MAX_EARLY_ACKS) {
-                const oldest = this.earlyAcks.keys().next().value;
-                if (oldest !== undefined) this.earlyAcks.delete(oldest);
-            }
-            this.earlyAcks.set(id, ack);
-        });
-
-        return client;
-    }
-
     /**
-     * Resolves once WhatsApp reports a decisive acknowledgement for the message
-     * (reached the server, or was rejected). Resolves with ACK_PENDING if no
-     * decisive ack arrives before the timeout.
+     * Builds one Baileys socket from the on-disk auth state and wires it to this
+     * service. Rejections (an unreadable auth dir, a non-directory at the path) are
+     * real init failures and are caught by initialize(), not here.
      */
-    private waitForAck(messageId: string, timeoutMs: number): Promise<number> {
-        const early = this.earlyAcks.get(messageId);
-        if (early !== undefined) {
-            this.earlyAcks.delete(messageId);
-            return Promise.resolve(early);
+    private async openSocket(): Promise<void> {
+        // Sampled before any await. Compared again at the install guard below.
+        const epoch = this.authEpoch;
+
+        // Dynamic import, NOT a top-level import. Baileys 7 is ESM-only, and one of its
+        // own dependencies (whatsapp-rust-bridge) exports only an "import" condition.
+        // Production starts under `tsx server.ts`, which compiles this file to CJS, so a
+        // static import becomes require() and tsx's CJS resolver rejects that dependency
+        // with ERR_PACKAGE_PATH_NOT_EXPORTED at module load, taking the whole server
+        // down, not just WhatsApp. A dynamic import() goes through the ESM loader and
+        // resolves it correctly. The type-only import above is erased, so it is safe.
+        const { makeWASocket, useMultiFileAuthState } = await import('@whiskeysockets/baileys');
+
+        // Not a React hook: Baileys' name merely starts with `use`, which trips
+        // react-hooks/rules-of-hooks inside a class.
+        // eslint-disable-next-line react-hooks/rules-of-hooks
+        const { state, saveCreds } = await useMultiFileAuthState(this.authDir);
+        // Local, not `this.wasRegistered`, until we know this socket is the one that
+        // gets installed: a socket we go on to discard must not leave its own
+        // registration state behind on the service (see the first-wins guard below).
+        const registered = !!state.creds?.registered;
+
+        const sock = makeWASocket({
+            auth: state,
+            logger: this.logger,
+            browser: WA_BROWSER,
+            // Send-only bot: never pull chat history, never mark the account online
+            // (the phone must keep getting notifications), never build link previews.
+            // Baileys' defaults are syncFullHistory: true and markOnlineOnConnect: true,
+            // both of which cost real memory on a 2 GB box.
+            syncFullHistory: false,
+            shouldSyncHistoryMessage: () => false,
+            markOnlineOnConnect: false,
+            generateHighQualityLinkPreview: false,
+            connectTimeoutMs: 30_000,
+            keepAliveIntervalMs: 30_000,
+        });
+
+        // First wins. A logout() landing while this call is parked on either await
+        // above re-arms initialize({ force: true }), and that re-arm can finish first
+        // (the auth dir it reads is now empty, so it has less to do). By the time we
+        // reach here, a socket may already be installed.
+        //
+        // Discard ours rather than overwrite it. The incumbent was built against the
+        // auth dir as it exists NOW, post-wipe, so it is the one that can issue the
+        // fresh QR the admin is waiting for; ours still holds the pre-wipe credentials
+        // they just asked us to destroy. Overwriting would report connected as the very
+        // account that was logged out, and strand the incumbent — never ended, every
+        // event it emits dropped by the identity guard in attach().
+        //
+        // graceful: false is deliberate. This socket is being thrown away, not logged
+        // out, and sock.logout() here would unlink the device from the phone.
+        // Two independent reasons to throw this socket away rather than install it.
+        //
+        // `this.sock` — another launch got there first. Only reachable via logout(),
+        // which is the one thing that clears isInitializing while a launch is parked.
+        //
+        // `epoch !== this.authEpoch` — the credentials this socket was built from were
+        // wiped while it was being built. This is the load-bearing half: without it the
+        // winner is decided by await-resolution order, and in the ordering where the
+        // in-flight launch reads creds.json just before logout() deletes it, the socket
+        // that wins carries the credentials the admin asked us to destroy. It would
+        // reach 'open', report isConnected() as that account, never show a QR, and its
+        // own saveCreds would rewrite the deleted credentials.
+        //
+        // graceful: false is deliberate. This socket is being thrown away, not logged
+        // out, and sock.logout() here would unlink the device from the phone.
+        if (this.sock || epoch !== this.authEpoch) {
+            const why = this.sock ? 'another socket was installed first' : 'its credentials were wiped mid-launch';
+            console.warn(`[WA:init] Discarding a socket that was built but not installed: ${why}.`);
+            await this.endSocket(sock, false);
+            return;
         }
 
-        return new Promise((resolve) => {
-            const settle = (ack: number) => {
-                clearTimeout(timer);
-                this.pendingAcks.delete(messageId);
-                resolve(ack);
-            };
-
-            const timer = setTimeout(() => settle(ACK_PENDING), timeoutMs);
-            this.pendingAcks.set(messageId, settle);
-        });
-    }
-
-    /** Cuts a client loose from every piece of shared service state. Synchronous. */
-    private detachClient(dead: Client) {
-        // Detach FIRST. destroy() can make the dying client emit 'disconnected',
-        // and a LOGOUT-shaped reason from a client we are deliberately discarding
-        // would raise a false wa_session_lost alert and page a human.
-        dead.removeAllListeners();
-        // removeAllListeners() above only reaches the Client EventEmitter — the
-        // browser-crash watcher (F1) lives on a different one (B1). Unconditional:
-        // the watch (if any) is always for the current client, never `dead`
-        // specifically by this point (S1) — see disarmBrowserWatch()'s doc.
-        this.disarmBrowserWatch();
-        this.isReady = false;
-        this.latestQR = null;
-        // A send waiting on an ack from a browser that is going away must fail now,
-        // not in 30s. settleAllPendingAcks also clears earlyAcks.
-        this.settleAllPendingAcks(ACK_PENDING);
+        this.wasRegistered = registered;
+        this.sock = sock;
+        try {
+            this.attach(sock, saveCreds);
+            this.armConnectWatchdog(sock);
+        } catch (err) {
+            // Installed but not fully wired. We own it, so we release it here rather
+            // than leaving that to initialize()'s catch — which must not touch
+            // this.sock, because on every other throw path the socket it points at
+            // belongs to somebody else (F4).
+            this.teardownSocket();
+            throw err;
+        }
     }
 
     /**
-     * Detaches the browser-crash watcher (see the `browserWatch` field), if one is
-     * armed, and nulls the field. Safe to call unconditionally — a no-op when
-     * nothing is armed.
+     * Subscribes to one socket's events. `sock` and `saveCreds` are closed over,
+     * never re-read from `this`: each initialize() produces a fresh
+     * { state, saveCreds } pair and they must not be crossed.
      *
-     * Deliberately takes no `dead` client to compare against: the watch is only
-     * ever armed for `this.client`'s current browser (there is at most one), so an
-     * identity check against a specific client is unnecessary and was actively
-     * wrong (S1) — a plain 'disconnected' or auth_failure can clear isInitializing
-     * without replacing the client, and the next initialize() then overwrites
-     * `browserWatch` with a new {browser, handler} pair while the *old* one either
-     * never got disarmed (nothing compared equal) or, worse, gets silently
-     * abandoned still-armed on the old browser. Unconditional disarm avoids both.
+     * The `this.sock !== sock` guard on every handler is the backstop for a socket
+     * that has been replaced or discarded. On creds.update it is not cosmetic: a
+     * discarded socket flushing stale creds into the shared auth directory would
+     * corrupt the live session's keys.
      */
-    private disarmBrowserWatch() {
-        if (!this.browserWatch) return;
-        // Real puppeteer.Browser has .off(); guard it anyway — the handler's own
-        // `this.client !== watchedClient` check is the actual backstop if a stub
-        // browser (or a real one mid-teardown) doesn't.
-        this.browserWatch.browser.off?.('disconnected', this.browserWatch.handler);
-        this.browserWatch = null;
+    private attach(sock: WASocket, saveCreds: () => Promise<void>): void {
+        sock.ev.on('creds.update', () => {
+            if (this.sock !== sock) return;
+            void saveCreds().catch((err) => console.error('[WA:auth] Failed to persist credentials:', err));
+        });
+        sock.ev.on('connection.update', (u) => this.onConnectionUpdate(sock, u));
+        sock.ev.on('messages.update', (updates) => this.onMessagesUpdate(sock, updates as MessageStatusUpdate[]));
+
+        // The raw ack listener lives on sock.ws, not sock.ev — see WA_ACK_EVENT.
+        // Assign the field BEFORE registering, so a throw from ws.on() still leaves
+        // detachSocket() able to remove it (off() on an unregistered handler is a no-op).
+        const handler = (node: unknown) => this.onServerAck(sock, node as AckNode);
+        this.ackHandler = handler;
+        if (typeof sock.ws?.on === 'function') {
+            sock.ws.on(WA_ACK_EVENT, handler);
+        } else {
+            // Cannot happen against the real library (ws is a public member of WASocket,
+            // lib/Socket/index.d.ts:216). Fail loudly rather than silently degrade: without
+            // this listener no group send can ever be confirmed, and silence would look
+            // exactly like the July outage.
+            this.ackHandler = null;
+            console.error('[WA:send] Socket exposes no ws emitter; server acks cannot be observed and every send will report as unconfirmed.');
+        }
+    }
+
+    /**
+     * WhatsApp's server acknowledged (or refused) one of our outbound message stanzas.
+     * `<ack class="message" id="…" [error="…"]>`: the error attribute is absent on
+     * success and a stringified numeric code on failure, mirroring Baileys' own
+     * handleBadAck (lib/Socket/messages-recv.js:1511).
+     *
+     * Matching is on attrs.id ONLY. attrs.from is never required: WhatsApp's addressing
+     * has both PN and LID forms and a `from` comparison would turn an addressing change
+     * into "every send fails". The ids are per-send unique values minted by
+     * generateMessageIDV2, so id equality is already exact.
+     */
+    private onServerAck(sock: WASocket, node: AckNode): void {
+        if (this.sock !== sock) return;
+        const attrs = node?.attrs;
+        const id = attrs?.id;
+        if (!id) return;
+        const error = attrs?.error;
+        this.recordSendOutcome(id, error ? 'rejected' : 'accepted', error ? `server ack error=${error}` : 'server ack');
+    }
+
+    /**
+     * For a DIRECT chat, Baileys turns receipts into messages.update with a status. For a
+     * group it never does (see WA_ACK_EVENT), so this is a secondary signal and, for a
+     * group, only ever carries a failure (handleBadAck's status: ERROR).
+     */
+    private onMessagesUpdate(sock: WASocket, updates: MessageStatusUpdate[]): void {
+        if (this.sock !== sock) return;
+        if (!Array.isArray(updates)) return;   // the payload is an array; defend against a mock or a library change
+        for (const u of updates) {
+            const id = u?.key?.id;
+            if (!id) continue;
+            const raw = u?.update?.status;
+            // NOT `if (!raw)`: WA_STATUS_ERROR is 0. Absent status means this update is
+            // about something else entirely (an edit, a revoke, a poll vote) and is not
+            // ours to judge.
+            if (raw === undefined || raw === null) continue;
+            const status = Number(raw);
+            if (Number.isNaN(status)) continue;
+            if (status === WA_STATUS_ERROR) {
+                this.recordSendOutcome(id, 'rejected', 'status=ERROR');
+            } else if (status >= WA_STATUS_SERVER_ACK) {
+                this.recordSendOutcome(id, 'accepted', `status=${status}`);
+            }
+            // WA_STATUS_PENDING (1) is the local pre-send state and is not decisive: keep waiting.
+        }
+    }
+
+    /**
+     * Routes a decisive outcome for `id` to its waiter, or buffers it if the waiter has
+     * not registered yet.
+     */
+    private recordSendOutcome(id: string, outcome: 'accepted' | 'rejected', why: string): void {
+        const settle = this.pendingSends.get(id);
+        if (settle) {
+            console.log(`[WA:send] ${outcome === 'accepted' ? 'Acknowledged' : 'Rejected'} id=${id} (${why}).`);
+            settle(outcome);          // settle() removes its own map entry and clears its timer
+            return;
+        }
+        // Nobody is waiting. Either the outcome beat its waiter's registration (the
+        // early-ack race), or it belongs to a send that already timed out or was
+        // abandoned, or to a message we never sent at all.
+        if (this.inFlightSends === 0) return;   // nothing is or will be waiting: drop it
+        const buffered = this.earlyAcks.get(id);
+        // First outcome wins, with one exception: a rejection may overwrite a buffered
+        // acceptance, never the reverse. Evidence that WhatsApp refused the message is
+        // stronger than evidence that it accepted it, and this project has already
+        // shipped a false success claim once.
+        if (buffered === 'rejected' || (buffered !== undefined && outcome === 'accepted')) return;
+        if (buffered === undefined && this.earlyAcks.size >= MAX_EARLY_ACKS) {
+            const oldest = this.earlyAcks.keys().next().value;
+            if (oldest !== undefined) this.earlyAcks.delete(oldest);
+        }
+        this.earlyAcks.set(id, outcome);
+    }
+
+    /**
+     * Resolves with the first decisive outcome for `id`, or 'timeout' after the ack
+     * budget. Never rejects. Resolves exactly once: settle deletes the map entry before
+     * resolving, so a second outcome for the same id finds nothing in pendingSends, and
+     * resolving a settled promise is a no-op regardless.
+     */
+    private waitForSendConfirmation(id: string): Promise<SendOutcome> {
+        const early = this.earlyAcks.get(id);
+        if (early !== undefined) {
+            this.earlyAcks.delete(id);
+            return Promise.resolve(early);
+        }
+        return new Promise<SendOutcome>((resolve) => {
+            const settle = (outcome: SendOutcome) => {
+                clearTimeout(timer);
+                this.pendingSends.delete(id);
+                resolve(outcome);
+            };
+            // unref so a pending ack wait cannot hold the Node event loop open through a
+            // shutdown; `?.` because Jest's fake timer handles have no unref (established
+            // pattern, see scheduleReconnect()).
+            const timer: ReturnType<typeof setTimeout> = setTimeout(() => settle('timeout'), this.ackTimeoutMs);
+            timer.unref?.();
+            this.pendingSends.set(id, settle);
+        });
+    }
+
+    /**
+     * Fails every in-flight send now, with the lifecycle event that killed it in the
+     * log. Synchronous and cannot throw (the settle closures only touch a map and
+     * resolve a promise; the awaiting continuations run later as microtasks).
+     */
+    private settleAllPendingSends(reason: string): void {
+        const count = this.pendingSends.size;
+        for (const settle of [...this.pendingSends.values()]) settle('abandoned');
+        this.pendingSends.clear();   // belt and braces; each settle() already removed its own entry
+        this.earlyAcks.clear();
+        if (count > 0) {
+            console.warn(`[WA:send] Settled ${count} in-flight send(s) as unconfirmed: ${reason}.`);
+        }
+    }
+
+    /**
+     * A send arrived with no open socket. Reports nothing to the caller (sendMessage()
+     * returns false itself) but asks for a bounded re-initialization so the next send
+     * has a chance. Master re-armed from sendMessage() with no floor at all, which is
+     * how a failing client got relaunched every 5s for as long as an admin page was
+     * open. S2 added the ladder; this keeps send-driven re-arms inside it and adds a
+     * floor for the two states the ladder does not cover.
+     */
+    private rearmAfterDisconnectedSend(): void {
+        if (this.isShuttingDown) return;
+        // Somebody is already on it.
+        if (this.isReady || this.isInitializing) return;
+        // A scheduled reconnect owns recovery; it is force:true and will not be blocked by
+        // any window, so re-arming here would only risk a second socket.
+        if (this.reconnectTimer) return;
+        const now = Date.now();
+        // The failure ladder owns recovery. initialize() would no-op at its own window
+        // check anyway; returning here keeps the log quiet, which is the point of backoff.
+        if (now < this.nextInitAllowedAt) return;
+        // And a floor of our own, so traffic cannot drive one socket per submission
+        // through the states that record no failure and arm no timer: an unpaired QR that
+        // nobody scanned (close with wasRegistered false), or a 401/403/411 stand-down
+        // after the creds were wiped. Kept separate from nextInitAllowedAt so getStatus()
+        // keeps reporting only real failure backoff to the admin UI.
+        if (now < this.nextSendRearmAllowedAt) return;
+        this.nextSendRearmAllowedAt = now + SEND_REARM_MIN_INTERVAL_MS;
+        console.log('[WA:send] Not connected; requesting a re-initialization.');
+        // Floating promise, non-forced. Non-forced is deliberate: force:true would bypass
+        // the backoff ladder, and submission traffic is exactly the thing that must not be
+        // able to do that. There is no process-wide unhandledRejection handler, so the
+        // catch is mandatory — an unswallowed rejection here would take down the whole
+        // server.
+        void this.initialize().catch((err) => console.error('[WA:send] Re-initialization failed:', err));
+    }
+
+    /**
+     * connection.update is emitted with partial payloads: a QR arrives as { qr }
+     * alone, pairing success as { isNewLogin: true, qr: undefined }, open as
+     * { connection: 'open' }, close as { connection: 'close', lastDisconnect }.
+     * Hence the independent ifs, and `if (qr)` rather than `'qr' in u` — a
+     * `qr: undefined` must not be mistaken for a new code.
+     *
+     * The identity guard on the first line is the single most important invariant
+     * in this file. A superseded socket's late event, applied to shared state, once
+     * put a dead client's QR into latestQR, so the code shown in the admin UI was
+     * frequently unscannable.
+     */
+    private onConnectionUpdate(sock: WASocket, u: Partial<ConnectionState>): void {
+        if (this.sock !== sock) return;
+
+        const { connection, qr, lastDisconnect, isNewLogin } = u;
+
+        if (qr) {
+            console.log(`[WA:qr] New QR code received (length: ${qr.length}). Awaiting scan.`);
+            this.latestQR = qr;
+        }
+
+        if (isNewLogin) {
+            console.log('[WA:auth] Pairing accepted. Session established.');
+            this.latestQR = null;
+        }
+
+        if (connection === 'open') {
+            this.clearConnectWatchdog();
+            console.log('[WA:ready] Socket open. Session established.');
+            this.isReady = true;
+            this.isInitializing = false;
+            this.latestQR = null;
+            this.consecutiveInitFailures = 0;
+            this.nextInitAllowedAt = 0;
+            this.nextSendRearmAllowedAt = 0;
+            return;
+        }
+
+        if (connection === 'close') {
+            this.onClose(sock, lastDisconnect);
+        }
+    }
+
+    /**
+     * Handles a close on the current socket. The socket is single-use: end() removes
+     * its own listeners and destroys its emitter, and `closed` is latched, so a
+     * closed socket can never reconnect. Every reconnect path therefore goes through
+     * initialize() and makeWASocket — never sock.ws.connect().
+     */
+    private onClose(sock: WASocket, lastDisconnect: ConnectionState['lastDisconnect']): void {
+        const statusCode = (lastDisconnect?.error as DisconnectError | undefined)?.output?.statusCode;
+        const reason = lastDisconnect?.error?.message ?? 'unknown';
+        const wasReady = this.isReady;
+        const wasRegistered = this.wasRegistered;
+
+        this.clearConnectWatchdog();
+        this.isReady = false;
+        this.isInitializing = false;
+        this.latestQR = null;
+        this.detachSocket(sock, `the socket closed (statusCode=${statusCode ?? 'none'})`);
+        this.sock = null;
+
+        console.warn(`[WA:conn] Socket closed. statusCode=${statusCode ?? 'none'} reason=${reason}`);
+
+        if (statusCode === WA_RESTART_REQUIRED) {
+            // The normal, expected path right after a successful first pairing: the
+            // preceding creds.update has been persisted and the server now asks for a
+            // restart. Not a failure — no backoff rung, no delay, no alert. Routing
+            // this through the transient branch would insert a 5s delay and burn a
+            // rung on a success; routing it through the terminal branch would delete
+            // the credentials the admin just created.
+            console.log('[WA:conn] Restart required after pairing; reconnecting immediately.');
+            void this.initialize({ force: true }).catch((err) =>
+                console.error('[WA:conn] Restart-required reconnect failed:', err),
+            );
+            return;
+        }
+
+        if (statusCode !== undefined && SESSION_LOST_CODES.has(statusCode)) {
+            // The session is gone. Wipe the credentials so the next socket issues a
+            // fresh QR, and stand down: no auto-reconnect, and no recordInitFailure()
+            // — a re-scan must not be rate-limited.
+            this.clearAuthDir();
+            if (this.intentionalLogout) {
+                console.log('[WA:conn] Intentional admin logout — alert suppressed.');
+            } else {
+                // Involuntary logout: the phone unlinked the device, or WhatsApp
+                // forced it. The bot cannot send until someone re-scans the QR.
+                this.emitSessionLostAlert(String(statusCode));
+            }
+            this.intentionalLogout = false; // one-shot; consume it
+            return;
+        }
+
+        if (statusCode === WA_CONNECTION_REPLACED) {
+            // Another socket connected with the same credentials. The creds are valid
+            // (the other session owns them), so do not wipe them, and do not
+            // auto-reconnect: reconnecting would evict the other session, which would
+            // reconnect and evict us — an unbounded ping-pong against WhatsApp.
+            console.warn('[WA:conn] Connection replaced by another session; standing down.');
+            this.emitSessionLostAlert('connection_replaced');
+            return;
+        }
+
+        if (!wasRegistered) {
+            // Nobody scanned the QR (Baileys ran out of QR refs and closed with 408),
+            // or the network dropped before pairing. Nothing was lost, so no alert and
+            // no failure. Release the socket and wait for a human: an admin tab left
+            // open overnight must not hold a connection to WhatsApp forever.
+            console.log('[WA:qr] No scan before the QR expired. Socket released; re-arm from the admin Reconnect button.');
+            return;
+        }
+
+        // Transient: a registered session dropped (408, 428, 500, 503, unknown). It
+        // self-heals, so no wa_session_lost — alerting here would page a human for
+        // every WhatsApp server blip. The /api/health/whatsapp uptime check is the
+        // detector for a transient that never heals.
+        const backoffMs = this.recordInitFailure();
+        console.warn(
+            `[WA:conn] ${wasReady ? 'Session dropped' : 'Connect attempt failed'} (consecutive failure ${this.consecutiveInitFailures}; next attempt allowed in ${backoffMs}ms).`,
+        );
+        this.scheduleReconnect(backoffMs);
+    }
+
+    /**
+     * Cuts a socket loose from this service. Synchronous, never throws. `reason` names
+     * the lifecycle event for the log line of any send it abandons.
+     */
+    private detachSocket(sock: WASocket, reason = 'the socket was detached'): void {
+        // Belt and braces alongside the identity guard: end() removes connection.update
+        // itself, but a socket discarded WITHOUT end() completing (a throw in
+        // openSocket() after attach()) would otherwise keep listeners into `this`.
+        try {
+            sock.ev.removeAllListeners('connection.update');
+            sock.ev.removeAllListeners('creds.update');
+            sock.ev.removeAllListeners('messages.update');
+        } catch { /* a socket already ev.destroy()'d throws nothing useful */ }
+        if (this.ackHandler) {
+            // off(), not removeAllListeners(WA_ACK_EVENT): Baileys' own bad-ack handler is
+            // registered on the same event, and sock.end() does not remove it either.
+            try { sock.ws?.off?.(WA_ACK_EVENT, this.ackHandler); } catch { /* emitter already gone */ }
+            this.ackHandler = null;
+        }
+        // A send waiting on an ack from a socket that is going away must fail now, not in
+        // 20s. This is the ONE call site that guarantees all four lifecycle paths that
+        // drop a socket (onClose, teardownSocket, logout, shutdown) settle their sends:
+        // they all funnel through here, so no future path can forget it.
+        this.settleAllPendingSends(reason);
+    }
+
+    /**
+     * Synchronously discards the current socket. Never throws. Used by initialize()'s
+     * catch and by the connect watchdog.
+     */
+    private teardownSocket(): void {
+        const sock = this.sock;
+        this.sock = null;
+        this.isReady = false;
+        this.latestQR = null;
+        this.clearConnectWatchdog();
+        if (sock) {
+            this.detachSocket(sock, 'the socket was torn down');
+            // sock.end takes `Error | undefined`, so undefined must be passed explicitly.
+            void sock.end(undefined).catch(() => { /* already dead; nothing to reclaim */ });
+        }
+    }
+
+    /**
+     * Bounded, never-throwing socket shutdown. `graceful` → sock.logout() (tells
+     * WhatsApp to unlink the device); otherwise sock.end() (drops the connection and
+     * leaves the device linked).
+     *
+     * 5s: there is no browser to coax shut — sock.logout() is one iq write plus a
+     * WebSocket close, and POST /api/admin/logout is awaited by a request that nginx
+     * abandons at 62s. A call that settles after the race loses is absorbed by the
+     * race's own handlers, so a late rejection cannot become an unhandledRejection —
+     * no extra .catch() is needed.
+     */
+    private async endSocket(sock: WASocket, graceful: boolean): Promise<void> {
+        const op = graceful ? () => sock.logout() : () => sock.end(undefined);
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+            await Promise.race([
+                op(),
+                new Promise<never>((_, reject) => {
+                    timer = setTimeout(
+                        () => reject(new Error(`socket teardown timed out after ${SOCKET_END_TIMEOUT_MS}ms`)),
+                        SOCKET_END_TIMEOUT_MS,
+                    );
+                }),
+            ]);
+        } catch (err) {
+            console.warn('[WA:logout] Socket teardown did not complete cleanly:', err);
+        } finally {
+            if (timer) clearTimeout(timer);
+        }
+    }
+
+    /**
+     * Arms the connecting-phase watchdog for `sock` (see CONNECT_WATCHDOG_MS). An
+     * unpaired socket that stalls does NOT auto-reconnect (nobody is waiting to
+     * scan) and does not alert (nothing was lost) — it still burns a backoff rung so
+     * a stuck admin tab cannot drive a loop.
+     *
+     * Covers the connecting phase only. A socket that reaches 'open' and then dies
+     * silently is caught by Baileys' own keep-alive, which emits a 408 close.
+     */
+    private armConnectWatchdog(sock: WASocket): void {
+        this.clearConnectWatchdog();
+        this.connectWatchdog = setTimeout(() => {
+            this.connectWatchdog = null;
+            if (this.sock !== sock || this.isShuttingDown) return;
+            console.error(`[WA:conn] Socket never reached 'open' within ${CONNECT_WATCHDOG_MS}ms. Treating as dead.`);
+            const wasRegistered = this.wasRegistered;
+            this.teardownSocket();
+            this.isInitializing = false;
+            const backoffMs = this.recordInitFailure();
+            if (wasRegistered) {
+                this.emitSessionLostAlert('connect_watchdog');
+                this.scheduleReconnect(backoffMs);
+            }
+        }, CONNECT_WATCHDOG_MS);
+        this.connectWatchdog.unref?.();
+    }
+
+    private clearConnectWatchdog(): void {
+        if (this.connectWatchdog) {
+            clearTimeout(this.connectWatchdog);
+            this.connectWatchdog = null;
+        }
+    }
+
+    /**
+     * Arms the single auto-reconnect timer. `force: true` is deliberate: the timer IS
+     * the backoff. Without it, the nextInitAllowedAt window recordInitFailure() just
+     * opened would race the timer it scheduled, and a millisecond of skew turns a
+     * reconnect into a silent no-op that nothing ever retries.
+     *
+     * clearReconnectTimer() here plus the same call at the top of initialize()
+     * guarantee at most one armed timer — the anti-storm invariant.
+     *
+     * `.unref?.()`: a pending reconnect must not hold the Node event loop open during
+     * a shutdown, and unref is absent on Jest's fake timer handles, hence the `?.`.
+     */
+    private scheduleReconnect(delayMs: number): void {
+        if (this.isShuttingDown) return;
+        this.clearReconnectTimer();
+        console.log(`[WA:conn] Reconnecting in ${delayMs}ms.`);
+        this.reconnectTimer = setTimeout(() => {
+            this.reconnectTimer = null;
+            void this.initialize({ force: true }).catch((err) =>
+                console.error('[WA:conn] Scheduled reconnect failed:', err),
+            );
+        }, delayMs);
+        this.reconnectTimer.unref?.();
+    }
+
+    private clearReconnectTimer(): void {
+        if (this.reconnectTimer) {
+            clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
+        }
     }
 
     /**
      * Advances the failure backoff ladder by one rung and returns the new gap in
-     * ms. Shared by client.initialize() rejecting (in the catch below) and by the
-     * post-launch browser-crash watcher (S3) — a browser that dies after a
-     * successful launch is a failure like any other; without this, launch ->
-     * crash -> relaunch runs completely unrate-limited, which is exactly the
-     * crash loop docker-compose.prod.yml's mem_limit can trigger.
+     * ms. Shared by initialize() rejecting, by the connect watchdog, and by a
+     * transient close — a socket that dies after a successful start is a failure
+     * like any other; without this, connect, drop, reconnect runs completely
+     * unrate-limited.
      */
     private recordInitFailure(): number {
         const i = Math.min(this.consecutiveInitFailures, INIT_BACKOFF_MS.length - 1);
@@ -316,96 +849,33 @@ class WhatsAppService {
     }
 
     /**
-     * Bounds a call that drives a puppeteer page/browser which may already be
-     * wedged — an unbounded await on one becomes the new hang. Never throws and
-     * never hangs past DESTROY_TIMEOUT_MS. A call that settles after the race
-     * loses is absorbed by the race's own handlers, so a late rejection cannot
-     * become an unhandledRejection — no extra .catch() is needed.
+     * Empties the auth directory so the next socket issues a fresh QR.
      *
-     * Shared by destroyClient() (client.destroy() on a browser we're discarding)
-     * and logout()'s client.logout() call: logout() is, since round 5, the
-     * primary control an admin has for clearing a wedged/stuck-initializing
-     * client (the disconnected-branch Logout button), so it is exactly the path
-     * most likely to hit a browser that is already unresponsive. Unbounded,
-     * client.logout()'s pupPage.evaluate() can block for the full
-     * protocolTimeout (120s) — well past nginx's 62s proxy_read_timeout, turning
-     * "recover the wedge" into a 504 with the recovery attempt still silently
-     * running behind it (round 6).
+     * Deletes the directory's CONTENTS, never the directory itself. In production
+     * /app/.baileys_auth is a Docker bind mount, and rmSync on a mount point fails
+     * with EBUSY on Linux, so a logout would silently leave the old credentials in
+     * place and log nothing out. Emptying it is equivalent for our purposes:
+     * useMultiFileAuthState falls back to initAuthCreds() whenever creds.json is
+     * unreadable.
+     *
+     * Never throws — a logout that cannot clear the directory is still a logout, and
+     * the socket is already gone.
      */
-    private async withTeardownTimeout(label: string, op: () => Promise<unknown>): Promise<void> {
-        let timer: ReturnType<typeof setTimeout> | undefined;
+    private clearAuthDir(): void {
+        // Bump first and unconditionally, before the early return. The epoch records
+        // the INTENT to invalidate; any socket already being built from the old
+        // credentials must be discarded even if there turned out to be nothing on
+        // disk to delete.
+        this.authEpoch += 1;
         try {
-            await Promise.race([
-                op(),
-                new Promise<never>((_, reject) => {
-                    timer = setTimeout(
-                        () => reject(new Error(`${label} timed out after ${DESTROY_TIMEOUT_MS}ms`)),
-                        DESTROY_TIMEOUT_MS,
-                    );
-                }),
-            ]);
+            if (!fs.existsSync(this.authDir)) return;
+            for (const entry of fs.readdirSync(this.authDir)) {
+                fs.rmSync(path.join(this.authDir, entry), { recursive: true, force: true });
+            }
+            console.log(`[WA:auth] Credentials cleared at ${this.authDir}.`);
         } catch (err) {
-            console.error(`[WA:cleanup] ${JSON.stringify({ event: CLEANUP_FAILED_EVENT, reason: String(err) })}`);
-        } finally {
-            if (timer) clearTimeout(timer);
+            console.error(`[WA:auth] Failed to clear credentials at ${this.authDir}:`, err);
         }
-    }
-
-    /**
-     * Best-effort browser teardown for a client we are throwing away. Never
-     * throws and never hangs (see withTeardownTimeout()).
-     *
-     * If the timeout wins, the orphan still holds the profile lock, so the next
-     * initialize() fails fast with "browser is already running" and is absorbed by
-     * the backoff. Bounded, not a relaunch loop.
-     */
-    private async destroyClient(client: Client): Promise<void> {
-        return this.withTeardownTimeout('destroy()', () => client.destroy());
-    }
-
-    /**
-     * Swaps in a fresh client, detaching the outgoing one's listeners first.
-     *
-     * Every handler registered in createClient() closes over `this`, so a client
-     * that is replaced without being unsubscribed keeps mutating shared service
-     * state long after it is supposed to be dead. In production that meant a
-     * replaced client carried on emitting 'qr' into this.latestQR alongside its
-     * replacement — two QR codes, milliseconds apart, overwriting each other —
-     * so the QR shown in the admin UI was frequently the dead client's, and
-     * scanning it did nothing. A late 'disconnected' from the old client could
-     * also clear isReady on a perfectly healthy new session.
-     */
-    private replaceClient() {
-        const dead = this.client;
-        this.detachClient(dead);
-        // Swap synchronously: this runs from sync event handlers, so this.client
-        // must never be observable as a corpse.
-        this.client = this.createClient();
-        // Unconditional orphan cleanup (A-FIX-2/A3). Fire-and-forget, and safe on
-        // paths where whatsapp-web.js already destroyed the client: destroy() is
-        // `if (browser?.isConnected()) close()` in 1.34.6 — a quiet no-op.
-        void this.destroyClient(dead);
-    }
-
-    /**
-     * Awaitable variant for the initialize() failure path: the old browser must be
-     * gone *before* the next attempt, or Chromium refuses the profile with
-     * "The browser is already running for <userDataDir>".
-     */
-    private async discardBrowser(): Promise<void> {
-        const dead = this.client;
-        this.detachClient(dead);
-        await this.destroyClient(dead);
-        this.client = this.createClient();
-    }
-
-    /** Releases every in-flight ack wait, e.g. when the client dies mid-send. */
-    private settleAllPendingAcks(ack: number) {
-        for (const settle of [...this.pendingAcks.values()]) {
-            settle(ack);
-        }
-        this.pendingAcks.clear();
-        this.earlyAcks.clear();
     }
 
     /**
@@ -417,197 +887,70 @@ class WhatsAppService {
         console.error(`[WA:alert] ${JSON.stringify({ event: SESSION_LOST_EVENT, reason })}`);
     }
 
-    /** Whether the client is connected and able to send — the health signal. */
+    /** Whether the socket is open and able to send — the health signal. */
     public isConnected(): boolean {
         return this.isReady;
     }
 
-    private getLockFilePath(): string {
-        const dataPath = process.env.WA_DATA_PATH || './.wwebjs_auth';
-        return path.join(dataPath, 'session', 'SingletonLock');
-    }
-
-    private clearStaleLock() {
-        const lockFile = this.getLockFilePath();
-        if (fs.existsSync(lockFile)) {
-            console.warn(`[WA:lock] Stale SingletonLock detected at ${lockFile}. Removing...`);
-            fs.rmSync(lockFile);
-            console.log('[WA:lock] Stale lock removed.');
-        } else {
-            console.log('[WA:lock] No stale lock found. Proceeding.');
-        }
-    }
-
-    private waitForLockRelease(timeoutMs = 10000): Promise<void> {
-        const lockFile = this.getLockFilePath();
-        return new Promise((resolve) => {
-            const start = Date.now();
-            const check = () => {
-                if (!fs.existsSync(lockFile)) {
-                    console.log(`[WA:lock] Lock released after ${Date.now() - start}ms.`);
-                    return resolve();
-                }
-                if (Date.now() - start > timeoutMs) {
-                    console.warn(`[WA:lock] Lock not released after ${timeoutMs}ms timeout. Removing forcefully...`);
-                    try { fs.rmSync(lockFile); } catch { }
-                    return resolve();
-                }
-                setTimeout(check, 200);
-            };
-            check();
-        });
-    }
-
     /**
-     * Launches the client: at most one attempt at a time, at most one per backoff
+     * Opens the Baileys socket: at most one attempt at a time, at most one per backoff
      * window.
      *
      * `force: true` skips the backoff window ONLY. It never starts a second
-     * concurrent attempt — two overlapping client.initialize() calls launch two
-     * Chromiums against one profile, which is the failure this fix exists to remove.
-     * That guarantee rests on `initInFlight`, not `isInitializing`: AUTHENTICATION_
-     * FAILURE and the AppState-changed disconnect route are wired up during
-     * inject(), which client.initialize() awaits, so both can clear isInitializing
-     * from *inside* this call, before it resolves. `initInFlight` is set only
-     * around the awaited call itself and no event handler can clear it, so a
-     * concurrent Reconnect/sendMessage() re-entering mid-launch is refused
-     * regardless of what the browser does while injecting.
+     * concurrent attempt — the isInitializing/isReady guard below is not bypassed, so
+     * two Reconnect clicks in a second still open exactly one socket.
      *
-     * Resolving does NOT mean connected: whatsapp-web.js resolves initialize() once
-     * the page is injected, which for an unpaired session is while the QR is on
-     * screen and the browser is very much alive. isInitializing therefore stays set
-     * until 'ready' / 'disconnected' / 'auth_failure' clears it. It is an
-     * "a browser is running" latch, not an "a call is in flight" latch.
+     * One latch is sufficient: the guard is synchronous, and the only await before
+     * `this.sock` is assigned is useMultiFileAuthState(). No event handler exists yet
+     * during that await — there is no socket — so nothing can clear isInitializing
+     * from inside the call.
+     *
+     * Resolving does NOT mean connected: openSocket() returns once the socket is
+     * created, which for an unpaired session is before the QR is even issued.
+     * isInitializing therefore stays set (no `finally` clears it) until 'open' / a
+     * close / the connect watchdog clears it. That is what makes
+     * getStatus().initializing truthful for the reconnect route.
      */
     public async initialize({ force = false }: { force?: boolean } = {}): Promise<void> {
         if (this.isShuttingDown) return;
 
-        if (this.initInFlight || this.isInitializing || this.isReady) {
-            console.log(`[WA:init] Skipping initialize — already ${this.isReady ? 'ready' : 'initializing'}.`);
+        if (this.isInitializing || this.isReady) {
+            console.log('[WA:init] Skipping initialize — already ' + (this.isReady ? 'connected' : 'connecting') + '.');
             return;
         }
 
         if (!force && Date.now() < this.nextInitAllowedAt) {
-            // Silent on purpose: every send attempt while the client is down lands
+            // Silent on purpose: every send attempt while the socket is down lands
             // here, and a line per suppressed attempt is the noise backoff removes.
             return;
         }
 
+        // A manual Reconnect supersedes any pending scheduled one.
+        this.clearReconnectTimer();
         this.isInitializing = true;
-        this.initInFlight = true;
-        console.log('[WA:init] Starting client initialization...');
+        console.log('[WA:init] Opening Baileys socket...');
 
         try {
-            // Disarm whatever crash watch is still armed BEFORE the launch, not
-            // after: an involuntary LOGOUT via Client.js's framenavigated route
-            // clears isReady/isInitializing WITHOUT destroying the browser or
-            // replacing the Client, so the watch from the previous successful
-            // launch stays armed on that still-live browser. If this attempt
-            // relaunches on the same Client and that old browser dies mid-launch,
-            // a disarm still sitting after the await would be too late — the
-            // stale handler already fired (this.client === watchedClient the
-            // whole time, since nothing replaced it) for a duplicate alert, an
-            // extra backoff rung, and isInitializing cleared mid-launch. Disarming
-            // here is a no-op whenever nothing is armed.
-            this.disarmBrowserWatch();
-
-            // Inside the try: an fs failure here is a real init failure and should
-            // be counted and backed off, not thrown at the caller.
-            this.clearStaleLock();
-            // Capture BEFORE the await, not just for the call itself: a concurrent
-            // logout() can swap this.client out from under us while we're
-            // suspended here (round 6 finding — e.g. admin clicks Reconnect, then
-            // Logout within a second or two, before this client's browser is even
-            // assigned). Everything below that needs "the client we actually
-            // launched" must use this captured reference, not a fresh this.client
-            // read, or it ends up asserting state against — and arming a watch on
-            // — an unrelated, never-launched replacement client instead.
-            const client = this.client;
-            await client.initialize();
-            this.consecutiveInitFailures = 0;
-            this.nextInitAllowedAt = 0;
-            // isInitializing intentionally left set — see the doc comment above.
-            // Defensive re-assert, guarded by `this.client === client`: without
-            // that guard, a concurrent logout() (see the capture comment above)
-            // would have this line latch isInitializing against a fresh,
-            // never-launched replacement client — a permanent wedge, since
-            // nothing else would ever clear it for that client.
-            if (!this.isReady && this.client === client) this.isInitializing = true;
-
-            // whatsapp-web.js registers no listener on the underlying Puppeteer
-            // browser process itself — its DISCONNECTED emit sites are all in-page
-            // events that cannot fire when the browser process is killed outright
-            // (e.g. OOM-killed by the memory cap in docker-compose.prod.yml).
-            // Without this, isReady stays latched true forever: health checks stay
-            // green, the admin UI hides Reconnect, and sendMessage() never re-arms
-            // — a loud outage becomes a silent one.
-            //
-            // Note: this only covers the *browser process* dying outright. A
-            // renderer-only OOM-kill leaves pupBrowser connected — Puppeteer's
-            // 'disconnected' never fires — so isReady stays latched true in that
-            // narrower case too. Not covered here; see the PR body.
-            const watchedClient = client;
-            const browser = watchedClient.pupBrowser;
-            if (browser) {
-                const handler = () => {
-                    // A browser we discarded/replaced on purpose, or shutdown
-                    // tearing down its own client, is not an alertable session
-                    // loss. Every intentional teardown disarms this explicitly
-                    // (B1); this check is the backstop for anything that fires
-                    // before the disarm lands.
-                    if (this.client !== watchedClient || this.isShuttingDown) return;
-                    // Not always a crash: Client.js's AppState-changed route can
-                    // reach here on a CONFLICT/UNPAIRED with the browser otherwise
-                    // fine, alongside genuine process death (OOM-kill, segfault).
-                    console.warn('[WA:browser] Puppeteer browser disconnected.');
-                    this.isReady = false;
-                    this.isInitializing = false;
-                    // Explicit off(), not just nulling the field: makes the
-                    // one-shot property a fact about this handler rather than
-                    // something only true because Browser happens to emit
-                    // 'disconnected' once (verified, but incidental to rely on).
-                    browser.off('disconnected', handler);
-                    this.browserWatch = null;
-                    const backoffMs = this.recordInitFailure();
-                    console.warn(
-                        `[WA:browser] Treating as init failure ${this.consecutiveInitFailures}; next attempt allowed in ${backoffMs}ms.`,
-                    );
-                    this.emitSessionLostAlert('browser_disconnected');
-                };
-                // `on`, not `once`: Puppeteer's once() stores an internal wrapper
-                // as the actual listener, so a later off(handler) can't find it —
-                // handlers.lastIndexOf(handler) is -1 and nothing is removed
-                // (verified against puppeteer-core's EventEmitter). The handler is
-                // already effectively one-shot: it nulls browserWatch itself, and
-                // a given Browser instance only ever emits 'disconnected' once.
-                browser.on('disconnected', handler);
-                this.browserWatch = { browser, handler };
-            }
+            await this.openSocket();
         } catch (err) {
-            // Hold the guard closed across cleanup: an event handler may already
-            // have cleared it (including the browser-crash handler above, which
-            // clears isInitializing mid-teardown on a live browser death) — any
-            // initialize() slipping in during the awaited teardown below would
-            // run against the client we are about to destroy. Re-entry stays
-            // refused regardless, via initInFlight rather than this flag.
-            this.isInitializing = true;
-
             const backoffMs = this.recordInitFailure();
             console.error(
-                `[WA:init] Client initialization failed (consecutive failure ${this.consecutiveInitFailures}; next attempt allowed in ${backoffMs}ms):`,
+                `[WA:init] Socket initialization failed (consecutive failure ${this.consecutiveInitFailures}; next attempt allowed in ${backoffMs}ms):`,
                 err,
             );
-
-            // discardBrowser()'s client swap runs outside any try of its own; if
-            // it throws, isInitializing must still clear or the service is wedged
-            // permanently (S2) — a container restart would be the only way out.
-            try {
-                await this.discardBrowser();
-            } finally {
-                this.isInitializing = false;
-            }
-        } finally {
-            this.initInFlight = false;
+            // Deliberately NOT teardownSocket(): every throw site in openSocket() is
+            // either before the socket is installed — in which case this.sock belongs
+            // to another launch and must not be destroyed — or already cleaned up by
+            // openSocket()'s own catch.
+            this.isInitializing = false;
+            // A failed init must retry. Master self-healed by accident, because
+            // sendMessage() re-armed initialize() whenever it was called while
+            // disconnected; the S2 stub does not, so without this the only thing that
+            // could ever recover a failed boot is an admin clicking Reconnect — an
+            // indefinite outage that raises no wa_session_lost alert. The ladder tops
+            // out at 15 min repeating, so even a genuinely fatal cause costs four log
+            // lines an hour, which is the only signal anyone gets.
+            this.scheduleReconnect(backoffMs);
         }
     }
 
@@ -616,11 +959,7 @@ class WhatsAppService {
         return {
             connected: this.isReady,
             hasQr: this.latestQR !== null,
-            // initInFlight closes a narrower window than isInitializing (see its
-            // field doc) but a caller asking "is a launch in progress?" needs
-            // both — otherwise the reconnect route can report 202 "starting" for
-            // a call that immediately no-ops at the initInFlight guard.
-            initializing: this.isInitializing || this.initInFlight,
+            initializing: this.isInitializing,
             consecutiveInitFailures: this.consecutiveInitFailures,
             nextInitAllowedAt: this.nextInitAllowedAt,
         };
@@ -631,16 +970,26 @@ class WhatsAppService {
             if (this.isShuttingDown) return;
             this.isShuttingDown = true;
 
-            console.log(`[WA:shutdown] ${signal} received. Destroying client gracefully...`);
+            console.log(`[WA:shutdown] ${signal} received. Closing WhatsApp socket...`);
 
-            const client = this.client; // a concurrent discardBrowser() may replace this.client
-            try {
-                await client.destroy();
-                console.log('[WA:shutdown] Client destroyed. Exiting.');
-            } catch (err) {
-                console.error('[WA:shutdown] Error during client destroy:', err);
+            this.clearReconnectTimer();
+            this.clearConnectWatchdog();
+            const sock = this.sock;
+            this.sock = null;
+            // Unconditional, not inside the `if (sock)`: this.sock can be null here (a
+            // 401 stand-down) and no detach would run. Idempotent with the one inside
+            // detachSocket(): the second call finds nothing and logs nothing.
+            this.settleAllPendingSends(`${signal} shutdown`);
+            if (sock) {
+                // Detach BEFORE ending so the resulting close event cannot re-enter and
+                // schedule a reconnect on the way out (isShuttingDown is a second guard
+                // on the same thing). end(), never logout(): a container restart must
+                // not unlink the device.
+                this.detachSocket(sock, `${signal} shutdown`);
+                await this.endSocket(sock, false);
             }
 
+            console.log('[WA:shutdown] Socket closed. Exiting.');
             process.exit(0);
         };
 
@@ -650,127 +999,214 @@ class WhatsAppService {
         }
     }
 
+    /**
+     * Sends `message` to `chatId` and resolves true ONLY once WhatsApp itself has
+     * acknowledged that exact message id.
+     *
+     * Signature and semantics are frozen: api/submit and api/admin/prayers/resend both do
+     * `const sent = await whatsappService?.sendMessage(target, text)` and write
+     * whatsappSent = true only when every target returned truthy.
+     *
+     * Deliberately NOT treated as success:
+     *  - sock.sendMessage() resolving. That means the stanza reached the TCP socket
+     *    (sendRawMessage awaits the ws.send callback, nothing more). The July outage was
+     *    caused by trusting exactly this class of signal; an earlier analysis then
+     *    concluded sends worked while every message sat at ack 0 forever.
+     *  - the local echo on messages.upsert, which Baileys emits from its own
+     *    upsertMessage() with no server involvement at all.
+     *  - status PENDING (1), which is the message's initial local state.
+     *  - the `status` field of the WAMessage that sock.sendMessage() returns: it is set
+     *    locally to PENDING before the stanza is even encrypted.
+     */
     public async sendMessage(chatId: string, message: string): Promise<boolean> {
-        console.log(`[WA:send] sendMessage called — isReady: ${this.isReady}, isInitializing: ${this.isInitializing}, chatId: ${chatId}`);
-        if (!this.isReady) {
-            console.warn('[WA:send] Client not ready. Message will not be sent.');
-            if (!this.isInitializing) {
-                console.log('[WA:send] Triggering re-initialization...');
-                // Floating promise: initialize() can reject (discardBrowser()'s
-                // this.client = this.createClient() runs outside any try), and
-                // there is no process-wide unhandledRejection handler — an
-                // unswallowed rejection here would crash the whole server.
-                this.initialize().catch((err) => {
-                    console.error('[WA:send] Re-initialization failed:', err);
-                });
-            }
+        const sock = this.sock;
+
+        // 1. Not connected: no socket to send on. Report failure and ask for a bounded re-arm.
+        if (!this.isReady || !sock) {
+            console.warn(`[WA:send] Not connected (ready=${this.isReady}, socket=${!!sock}). Not sending ${message.length} chars to ${chatId}.`);
+            this.rearmAfterDisconnectedSend();
             return false;
         }
 
-        try {
-            // sendMessage() resolving only means WhatsApp Web accepted the message
-            // into its outbound queue — not that WhatsApp delivered it. A wrong chat
-            // id, or an account that is no longer in the group, resolves here and is
-            // then dropped server-side. Wait for the ack before reporting success.
-            const sent = await this.client.sendMessage(chatId, message) as SentMessage | undefined;
+        // 2. Cheap input guard. relayMessage() destructures jidDecode(jid) directly
+        // (lib/Socket/messages-send.js:434) and jidDecode returns undefined for a string
+        // with no '@' (lib/WABinary/jid-utils.js:30-35), so a malformed chat id fails as
+        // an opaque TypeError from library internals. Naming it here costs one line and
+        // makes the log actionable: the value comes from the whatsapp_group_ids app
+        // setting, typed by an admin.
+        if (!chatId.includes('@')) {
+            console.error(`[WA:send] Refusing to send: "${chatId}" is not a WhatsApp jid (expected user@s.whatsapp.net or id@g.us).`);
+            return false;
+        }
 
-            if (typeof sent?.ack === 'number' && sent.ack >= ACK_SERVER) {
-                console.log(`[WA:send] Message delivered to ${chatId} (ack: ${sent.ack}).`);
-                return true;
+        // 3. Backstop bound, not an expected limit.
+        if (this.pendingSends.size >= MAX_PENDING_SENDS) {
+            console.error(`[WA:send] ${this.pendingSends.size} sends already awaiting acknowledgement (cap ${MAX_PENDING_SENDS}). Shedding this one.`);
+            return false;
+        }
+
+        this.inFlightSends++;
+        try {
+            // 4. Relay, bounded. linkPreview: null is load-bearing, not cosmetic: for
+            // { text } with linkPreview undefined, generateWAMessageContent calls
+            // generateLinkPreviewIfRequired (lib/Utils/messages.js:278-281), which fetches
+            // any https:// URL found in the text via link-preview-js. The text here is
+            // anonymous, unvalidated, user-submitted prayer content, so leaving it
+            // undefined turns every submission into an outbound HTTP request from the
+            // production box, chosen by whoever filled in the form. null skips it
+            // entirely; WAUrlInfo | null is the declared type (lib/Types/Message.d.ts:172).
+            let sent: SentMessage | undefined;
+            let relayTimedOut = false;
+            const relay = sock.sendMessage(chatId, { text: message, linkPreview: null }) as Promise<SentMessage | undefined>;
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            try {
+                sent = await Promise.race([
+                    relay,
+                    new Promise<never>((_, reject) => {
+                        timer = setTimeout(() => {
+                            relayTimedOut = true;
+                            reject(new Error(`sock.sendMessage() did not settle within ${this.relayTimeoutMs}ms`));
+                        }, this.relayTimeoutMs);
+                        timer.unref?.();
+                    }),
+                ]);
+            } catch (err) {
+                // A send to a chat the account has left, an invalid jid, a socket that
+                // closed between the isReady check and here (sendRawMessage throws Boom
+                // 'Connection Closed' / 428 when !ws.isOpen), a group metadata query that
+                // timed out — all land here, all mean "not sent".
+                console.error(`[WA:send] sock.sendMessage() failed for ${chatId}:`, err);
+                // The abandoned promise must not become an unhandledRejection, and if it
+                // later succeeds an operator needs to know a message went out that we
+                // recorded as unsent. Diagnostic only: the boolean has already been decided.
+                if (relayTimedOut) {
+                    relay.then(
+                        (late) => console.error(`[WA:send] A send to ${chatId} completed AFTER its ${this.relayTimeoutMs}ms deadline (id=${late?.key?.id ?? 'unknown'}). It is recorded as NOT sent; the group may show it.`),
+                        (lateErr) => console.warn(`[WA:send] The abandoned send to ${chatId} later failed:`, lateErr),
+                    );
+                }
+                return false;
+            } finally {
+                if (timer) clearTimeout(timer);
             }
 
-            const messageId = sent?.id?._serialized;
-            if (!messageId) {
-                console.error(`[WA:send] No message id returned for ${chatId}; cannot confirm delivery.`);
+            // 5. The socket was replaced while we were relaying (a close, the watchdog, an
+            // admin logout). Our waiter is not registered yet and settleAllPendingSends()
+            // has already run and cleared earlyAcks, so registering now would just burn the
+            // full ack budget waiting for a socket that no longer exists. Fail immediately
+            // instead.
+            if (this.sock !== sock) {
+                console.warn(`[WA:send] The socket was replaced while sending to ${chatId}; the outcome is unknown. Recording as not sent.`);
                 return false;
             }
 
-            const ack = await this.waitForAck(messageId, this.ackTimeoutMs);
+            // 6. No id, no confirmation possible. sendMessage()'s declared return type is
+            // WAMessage | undefined; the undefined branch is the disappearingMessagesInChat
+            // group-settings path (lib/Socket/messages-send.js:1055-1067), which { text }
+            // never takes — but the type says it can, so it is handled rather than
+            // asserted away. This is also the closest thing to the July failure: the ONE
+            // field we need is missing. It must log loudly and report false, never true.
+            const id = sent?.key?.id;
+            if (!id) {
+                console.error(`[WA:send] sock.sendMessage() returned no message key for ${chatId}; delivery cannot be confirmed. Recording as not sent.`);
+                return false;
+            }
 
-            if (ack >= ACK_SERVER) {
-                console.log(`[WA:send] Message delivered to ${chatId} (ack: ${ack}).`);
+            // 7. Wait for WhatsApp.
+            const outcome = await this.waitForSendConfirmation(id);
+
+            if (outcome === 'accepted') {
+                console.log(`[WA:send] WhatsApp accepted the message to ${chatId} (id=${id}).`);
                 return true;
             }
-
-            if (ack === ACK_ERROR) {
-                console.error(`[WA:send] WhatsApp rejected the message to ${chatId} (ack: ${ack}). Check the chat id is valid and the account is a participant.`);
-            } else {
-                console.error(`[WA:send] No delivery ack from WhatsApp for ${chatId} within ${this.ackTimeoutMs}ms. Treating as not sent.`);
+            if (outcome === 'rejected') {
+                console.error(`[WA:send] WhatsApp REJECTED the message to ${chatId} (id=${id}). Check the chat id is valid and this account is still a participant.`);
+                return false;
             }
+            if (outcome === 'timeout') {
+                console.error(`[WA:send] No acknowledgement from WhatsApp for ${chatId} (id=${id}) within ${this.ackTimeoutMs}ms. Treating as not sent.`);
+                return false;
+            }
+            console.warn(`[WA:send] The send to ${chatId} (id=${id}) was abandoned before WhatsApp acknowledged it. Treating as not sent.`);
             return false;
-        } catch (error) {
-            console.error(`[WA:send] Failed to send message to ${chatId}:`, error);
-            return false;
+        } finally {
+            this.inFlightSends--;
         }
     }
 
     public async logout(): Promise<boolean> {
         console.log(`[WA:logout] Logout requested — isReady: ${this.isReady}`);
 
-        // Mark this as intentional so the LOGOUT `disconnected` event it triggers
-        // does not raise the session-lost alert. The event consumes this flag.
+        // Mark this as intentional so the loggedOut close it triggers does not raise
+        // the session-lost alert. The close consumes this flag.
         this.intentionalLogout = true;
-        // The browser-crash watcher (F1) lives on the Puppeteer Browser, not the
-        // Client, so it survives both client.logout() and client.destroy() below
-        // — either can close the browser and fire 'disconnected' on it, and at
-        // that point this.client hasn't been swapped yet (replaceClient() is far
-        // below), so the watcher's own guard hasn't engaged either. Disarm up
-        // front, before either call can trigger it (B1).
-        this.disarmBrowserWatch();
+        // A pending scheduled reconnect must never fire after an admin logout — the
+        // forced re-init at the end of this method is the only thing that reopens a
+        // socket.
+        this.clearReconnectTimer();
+        this.clearConnectWatchdog();
 
-        if (this.isReady) {
-            // Bounded (round 6 finding 2): an unbounded client.logout() against a
-            // wedged page is the exact "cleanup becomes the new hang" scenario
-            // DESTROY_TIMEOUT_MS exists to prevent — see withTeardownTimeout()'s
-            // doc comment. Never throws, so no try/catch needed here any more.
-            await this.withTeardownTimeout('logout()', () => this.client.logout());
-            console.log('[WA:logout] logout() attempt complete.');
-        } else {
-            console.log('[WA:logout] Client not in ready state — skipping logout() call, proceeding to destroy.');
+        const sock = this.sock;
+        if (!sock && this.isInitializing) {
+            // The in-flight openSocket() (suspended in useMultiFileAuthState) cannot be
+            // cancelled; it will complete and assign this.sock later. Accepted, not
+            // prevented — the socket it builds either reaches 'open' on the now-deleted
+            // creds (the admin's next Logout catches it) or closes and is handled
+            // normally.
+            console.log('[WA:logout] A connection attempt was in flight; it will be superseded.');
         }
 
-        // Same bounded, never-throwing teardown every other discard path uses
-        // (replaceClient()/discardBrowser()) — an unbounded destroy() here would
-        // undo the whole point of giving the admin a Logout button as a wedge
-        // escape hatch (round 6 finding 2).
-        await this.destroyClient(this.client);
-        console.log('[WA:logout] destroy() attempt complete.');
+        if (sock) {
+            // Bounded and never throws (see endSocket()). sock.logout() sends a
+            // remove-companion-device iq and then ends the socket WITHOUT awaiting the
+            // close, so this resolves before the loggedOut close fires. Both orderings
+            // are handled: if the close lands first, intentionalLogout is still true
+            // and the alert is suppressed; if it lands after the detach below, the
+            // identity guard drops it.
+            // isReady OR wasRegistered: a socket holding valid credentials that has not
+            // yet reached 'open' still has a live entry in the phone's Linked Devices.
+            // end()ing it wipes our copy and leaves that entry stranded, burning one of
+            // WhatsApp's few companion slots with a zombie the admin cannot tell from a
+            // live one — and the trigger is ordinary, clicking Logout while a reconnect
+            // is in flight. sock.logout() may fail on a not-yet-authenticated socket;
+            // endSocket() is bounded and never throws, so the cost of trying is one log
+            // line and the benefit is that the common case actually unlinks.
+            await this.endSocket(sock, this.isReady || this.wasRegistered);
+        }
+
+        this.sock = null;
+        if (sock) this.detachSocket(sock, 'an admin logout');
 
         this.isReady = false;
-        this.latestQR = null;
         this.isInitializing = false;
-        this.settleAllPendingAcks(ACK_PENDING);
+        this.latestQR = null;
+        // Unconditional: `sock` can be null here (logout after a 401 stand-down) and the
+        // detach above is then skipped. Idempotent with the one inside detachSocket().
+        this.settleAllPendingSends('an admin logout');
 
-        console.log('[WA:logout] Waiting for Chromium to release browser lock...');
-        await this.waitForLockRelease();
+        // Wipe credentials so the next socket issues a fresh QR.
+        this.clearAuthDir();
 
-        console.log('[WA:logout] Re-creating client for new session...');
-        this.replaceClient();
-        // Belt-and-braces, deliberately placed AFTER replaceClient(): the LOGOUT
-        // `disconnected` event normally consumes this flag (line ~167), but if
-        // client.logout() threw above, that event may never fire. Resetting it
-        // any earlier — e.g. right after destroy(), ~10s before replaceClient()
-        // detaches the old client's listeners via waitForLockRelease() — would
-        // leave a window where a late LOGOUT-shaped disconnect from the
-        // still-attached old client reads the flag as already false and raises a
-        // false alert. By here the old listeners are gone, so it's safe.
+        // An admin logout is not a failure, and must not leave the re-arm sitting
+        // inside a 15-minute backoff window. The same goes for the send-triggered
+        // re-arm floor: a logout makes the previous throttle stale.
+        this.consecutiveInitFailures = 0;
+        this.nextInitAllowedAt = 0;
+        this.nextSendRearmAllowedAt = 0;
+
+        // Belt-and-braces, deliberately placed AFTER the detach above: the loggedOut
+        // close normally consumes this flag, but if sock.logout() threw or timed out,
+        // that close may never fire. Resetting it any earlier would leave a window
+        // where a late loggedOut-shaped close from the still-attached old socket reads
+        // the flag as already false and raises a false alert. By here the old
+        // listeners are gone, so it's safe.
         this.intentionalLogout = false;
-        // Floating promise: see the comment on the sendMessage() re-arm call —
-        // a rejection here must not be allowed to reach the process as unhandled.
-        // Does not check initInFlight first: if a launch is already running (e.g.
-        // an admin hit Logout from the disconnected/wedged branch while an earlier
-        // Reconnect was still mid-launch on the client this logout() just replaced
-        // via replaceClient()), initialize() itself no-ops at its own guard rather
-        // than erroring. NOT fully self-healing in that case, though: the
-        // still-running launch resumes later holding its own captured client
-        // reference (see initialize()'s `client` capture comment), not
-        // this.client — which by then is this logout()'s fresh replacement. Its
-        // own state updates are guarded so they can't corrupt the replacement's
-        // state, but the browser that launch produces is left unreferenced by
-        // anything this.client points to: an orphaned Chromium, cleared only by
-        // a container restart. A second Reconnect click on the (correct) new
-        // client works normally; it just doesn't retroactively adopt the first.
-        this.initialize({ force: true }).catch((err) => {
+
+        // Floating promise: initialize() can reject, and there is no process-wide
+        // unhandledRejection handler — an unswallowed rejection here would crash the
+        // whole server. It opens one socket against the now-empty auth dir, which
+        // produces a fresh QR.
+        void this.initialize({ force: true }).catch((err) => {
             console.error('[WA:logout] Re-arm after logout failed:', err);
         });
         return true;
