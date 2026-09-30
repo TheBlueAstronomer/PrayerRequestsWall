@@ -3920,6 +3920,48 @@ describe('spec 3.16: env overrides and content shape', () => {
         expect(send.value).toBe(false);
     });
 
+    // Added by the pipeline LEAD after the S3 review (risk 5). A NEGATIVE value is
+    // truthy, so it survives the `|| DEFAULT` and used to yield a timer that fires
+    // immediately: every send would report a timeout while messages arrived fine — the
+    // July failure shape, reachable by one operator typo.
+    it.each([['-5'], ['-20000'], ['1e-9']])(
+        '3.16 WA_ACK_TIMEOUT_MS=%s is floored at 1s instead of timing out instantly',
+        async (value) => {
+            const { svc, state } = await loadOpen({ env: { WA_ACK_TIMEOUT_MS: value } });
+            state.sockSend.mockResolvedValue(sentKey('MSGID1', GROUP));
+            const send = track(svc.sendMessage(GROUP, 'hello'));
+            await flush();
+
+            // Not settled before the floor...
+            await advance(999);
+            expect(send.done).toBe(false);
+            // ...and an ack arriving inside the floor still confirms it.
+            serverAck(state, 0, { id: 'MSGID1', from: GROUP });
+            await flush();
+            expect(send.value).toBe(true);
+        },
+    );
+
+    it('3.16 a negative WA_SEND_RELAY_TIMEOUT_MS is floored too, so an in-flight relay is not abandoned at once', async () => {
+        // The relay must be PARKED for this to discriminate. A mockResolvedValue relay wins
+        // the Promise.race as a microtask no matter how small the timer is, so that version
+        // of this test passed even with the floor removed — it could not fail.
+        const { svc, state } = await loadOpen({ env: { WA_SEND_RELAY_TIMEOUT_MS: '-1' } });
+        const parked = parkSend(state, sentKey('MSGID1', GROUP));
+        const send = track(svc.sendMessage(GROUP, 'hello'));
+        await flush();
+
+        // Unfloored, setTimeout(-1) fires on the next tick and abandons the relay.
+        await advance(999);
+        expect(send.done).toBe(false);
+
+        parked.release();
+        await flush();
+        serverAck(state, 0, { id: 'MSGID1', from: GROUP });
+        await flush();
+        expect(send.value).toBe(true);
+    });
+
     it('3.16 env from an earlier test does not leak: a fresh load sees the defaults again', async () => {
         expect(process.env.WA_ACK_TIMEOUT_MS).toBeUndefined();
         expect(process.env.WA_SEND_RELAY_TIMEOUT_MS).toBeUndefined();

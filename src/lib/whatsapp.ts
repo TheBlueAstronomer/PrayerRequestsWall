@@ -254,8 +254,17 @@ class WhatsAppService {
     private nextSendRearmAllowedAt: number = 0;
 
     /** Read once at construction so a test can set the env before importing. */
-    private readonly ackTimeoutMs: number = Number(process.env.WA_ACK_TIMEOUT_MS) || DEFAULT_ACK_TIMEOUT_MS;
-    private readonly relayTimeoutMs: number = Number(process.env.WA_SEND_RELAY_TIMEOUT_MS) || DEFAULT_RELAY_TIMEOUT_MS;
+    /**
+     * `|| DEFAULT` handles 0, '' and unparseable text. The Math.max floor handles the
+     * two remaining operator typos, which fail in the worst possible direction: a
+     * NEGATIVE value is truthy, so it survives the `||` and yields a timer that fires
+     * immediately — every send would report a timeout while messages arrived fine,
+     * which is indistinguishable from the July bug. (A value above 2^31-1 is clamped
+     * by Node to 1 ms, with the same effect.) One second is below any plausible real
+     * setting and above any value that breaks the feature.
+     */
+    private readonly ackTimeoutMs: number = Math.max(1_000, Number(process.env.WA_ACK_TIMEOUT_MS) || DEFAULT_ACK_TIMEOUT_MS);
+    private readonly relayTimeoutMs: number = Math.max(1_000, Number(process.env.WA_SEND_RELAY_TIMEOUT_MS) || DEFAULT_RELAY_TIMEOUT_MS);
 
     /** Resolved once in the constructor so tests can set WA_AUTH_PATH before import. */
     private readonly authDir: string;
