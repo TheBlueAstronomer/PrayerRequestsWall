@@ -42,7 +42,8 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 
-# whatsapp-web.js auth
+# WhatsApp auth (Baileys; wwebjs entries kept until the local leftovers are deleted)
+.baileys_auth
 .wwebjs_auth
 .wwebjs_auth.zip
 .wwebjs_cache

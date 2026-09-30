@@ -26,7 +26,7 @@ Project Intercessor is a digital safe haven for youth group members to share pra
 -   **Styling:** [Tailwind CSS 4](https://tailwindcss.com/)
 -   **Animations:** [Framer Motion](https://www.framer.com/motion/)
 -   **Database:** [SQLite](https://www.sqlite.org/) with [Drizzle ORM](https://orm.drizzle.team/)
--   **WhatsApp:** [whatsapp-web.js](https://wwebjs.dev/)
+-   **WhatsApp:** [Baileys](https://github.com/WhiskeySockets/Baileys) (`@whiskeysockets/baileys`) — no browser
 
 ## Getting Started
 

@@ -1,6 +1,7 @@
 node_modules
 .next
 .git
+.baileys_auth
 .wwebjs_auth
 .wwebjs_cache
 sqlite.db

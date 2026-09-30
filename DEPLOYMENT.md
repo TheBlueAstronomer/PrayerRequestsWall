@@ -62,11 +62,12 @@ sudo apt-get update && sudo apt-get install -y google-cloud-cli
 
 # Create persistent data directories (paths are volume-mounted in docker-compose.prod.yml)
 sudo mkdir -p /var/intercessor/app
-sudo mkdir -p /var/intercessor/data/wwebjs_auth
+sudo mkdir -p /var/intercessor/data/baileys_auth
 sudo mkdir -p /var/intercessor/data/backups
 sudo mkdir -p /var/intercessor/data/certbot/conf
 sudo mkdir -p /var/intercessor/data/certbot/www
 sudo chown -R 1000:1000 /var/intercessor/data
+sudo chmod 700 /var/intercessor/data/baileys_auth
 
 # Create the deploy-user account used by Cloud Build for SSH
 sudo useradd -m -s /bin/bash deploy-user
@@ -77,6 +78,8 @@ sudo chmod 700 /home/deploy-user/.ssh
 sudo chown -R deploy-user:deploy-user /home/deploy-user/.ssh
 ```
 
+> On an existing VM, `/var/intercessor/data/wwebjs_auth` is still present. **Leave it alone** — it is the rollback path described in `BAILEYS-MIGRATION-PLAN.md` section 8. It is no longer mounted into the container.
+
 ### 3. Create the `.env` File on the VM
 
 ```bash
@@ -84,6 +87,8 @@ sudo nano /var/intercessor/app/.env
 ```
 
 Populate with all required environment variables. The `env_file` directive in `docker-compose.prod.yml` references this path.
+
+> Do **not** add `WA_AUTH_PATH` here. It is set in `docker-compose.prod.yml` next to the volume mount it has to agree with, and Compose's `environment:` overrides `env_file:` anyway. This file holds only secrets (`ADMIN_PASSWORD`, `ADMIN_SESSION_SECRET`) and is `chmod 600`; deploys never rewrite it.
 
 ---
 
@@ -186,16 +191,26 @@ Certificates are persisted at `/var/intercessor/data/certbot/conf`.
 
 ## Part 5: WhatsApp Authentication (First Run)
 
-WhatsApp Web.js requires a QR code scan on first launch. Session data is persisted so this only happens once.
+Baileys requires a QR-code scan on first launch. The session is persisted to
+`/var/intercessor/data/baileys_auth` (bind-mounted to `/app/.baileys_auth`), so this
+happens once, not on every restart.
 
-1. SSH into the VM.
-2. Tail the app logs:
-   ```bash
-   cd /var/intercessor/app
-   docker-compose -f docker-compose.prod.yml logs -f app
-   ```
-3. Scan the QR code shown in the terminal using WhatsApp on your phone.
-4. Logs should show `Client is ready!`. Session is saved to `/var/intercessor/data/wwebjs_auth`.
+> **Expected page, not a failed deploy:** the first deploy after the Baileys migration starts with an empty auth directory, so `/api/health/whatsapp` returns 503 and the WhatsApp-connected uptime alert fires until the QR is scanned.
+
+1. Open `https://tribeprayer.org/admin` and log in.
+2. The QR code is rendered on the page. There is **no QR in the container log** any
+   more — the old `whatsapp-web.js` setup printed one there; Baileys does not.
+3. Scan it with WhatsApp on your phone (Settings → Linked devices → Link a device).
+   The device appears as **TribePrayer**.
+4. Confirm: `curl -s https://tribeprayer.org/api/health/whatsapp` returns 200. While
+   unpaired it returns 503 with `needsScan` — that is a legitimate state, not a fault.
+
+If the QR never appears, tail the log for `[WA:qr] New QR code received`:
+
+```bash
+cd /var/intercessor/app
+docker-compose -f docker-compose.prod.yml logs -f app
+```
 
 ---
 
@@ -225,6 +240,28 @@ The SQLite database is bind-mounted at `/var/intercessor/data/sqlite.db`.
 sqlite3 /var/intercessor/data/sqlite.db
 # e.g. SELECT * FROM prayer_requests;
 ```
+
+---
+
+## Part 8: Routine Checks
+
+### Disk
+
+This box has died of a full boot disk once (39 days, 2026-06-05). `baileys_auth` is a
+new directory that only ever grows: `useMultiFileAuthState` writes one small JSON file
+per signal key, and the app prunes them only on logout or session loss. It is not a
+real threat for a send-only bot — these files are well under a kilobyte each — but it
+is unbounded, so it gets checked rather than assumed:
+
+```bash
+du -sh /var/intercessor/data/baileys_auth
+ls -1 /var/intercessor/data/baileys_auth | wc -l
+df -h /
+```
+
+Expect a few hundred kilobytes and tens of files. Tens of megabytes or thousands of
+files means the prune path is not running; investigate rather than deleting by hand
+(deleting `creds.json` costs a QR scan).
 
 ---
 

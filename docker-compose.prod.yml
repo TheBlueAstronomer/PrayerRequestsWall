@@ -3,37 +3,80 @@ services:
     image: asia-south1-docker.pkg.dev/${PROJECT_ID}/prayer-repository/prayer-wall-app:latest
     container_name: prayer-wall-app-prod
     restart: always
-    # tini as PID 1. Chromium runs with --no-zygote and re-parents its helpers;
-    # `npm start` is not an init and never reaps them, so they accumulated at ~2
-    # zombies / 5s during the relaunch loop and ate the PID table — the most likely
-    # reason sshd could not fork a login shell during the 2026-08-07 outage.
+    # tini as PID 1. Kept after the Baileys migration even though the Chromium
+    # zombie storm it was added for (~2 zombies / 5s during the 2026-08-07 relaunch
+    # loop, which is the most likely reason sshd could not fork a login shell) is
+    # gone with the browser. `npm start` is still not an init and still never reaps,
+    # so anything that forks later — npm itself, a future sidecar script — would
+    # leak into the PID table again. It costs nothing; keeping it is free insurance.
     init: true
     # Bound the blast radius. With no limit the container can take all 2 GB of RAM
     # and all 2 GB of swap, and `restart: always` never fires because the process
     # degrades instead of exiting. memswap_limit == mem_limit means "no swap at all"
-    # for this cgroup in Docker's semantics.
+    # for this cgroup in Docker's semantics — which is now the POINT rather than a
+    # side effect. Both the 2026-08-07 and 2026-08-29 outages were this container
+    # quietly eating swap for days while CPU and disk looked normal. With no swap to
+    # eat, a leak gets OOM-killed and `restart: always` brings it back in seconds
+    # instead of wedging the whole host for 32 days.
     #
-    # 1600m, NOT the 1400m first proposed: a healthy single Chromium measures
-    # 0.9-1.4 GB, so 1400m sits inside the healthy band and would OOM-kill good
-    # containers. 1600m clears the healthy peak by ~200 MB and still leaves ~380 MB
-    # for the host, nginx and sshd on the 1.98 GB box. Tighten once A-AC-8 has a
-    # real steady-state number.
+    # 768m, down from 1600m. The 1600m figure existed only to clear a healthy single
+    # Chromium's 0.9-1.4 GB band. There is no Chromium now: the S1 spike measured a
+    # live Baileys socket at 102.4 MB peak RSS, of which 80.5 MB is the Node runtime
+    # itself. This process is that socket PLUS the Next.js 16 production server and
+    # tsx's resident esbuild, so budget ~250-350 MB steady state.
     #
-    # cgroup v1 caveat (verify on the VM, P1): memswap_limit is silently ignored
-    # without the kernel booted with swapaccount=1 — Docker logs "Your kernel does
-    # not support swap limit capabilities" and mem_limit alone still applies.
-    mem_limit: 1600m
-    memswap_limit: 1600m
-    # Kept as-is. Largely moot given Chromium runs with --disable-dev-shm-usage,
-    # but note tmpfs pages count against mem_limit — do not raise this.
-    shm_size: '1gb'
+    # 768m is roughly 2x that budget, and errs deliberately in the same direction the
+    # 1600m choice did: a limit set just above the expected band OOM-kills HEALTHY
+    # containers, and we have a measured Baileys number but no measured Next.js one.
+    # Tighten to ~512m at S6 once `docker stats` has produced a real steady-state
+    # figure (BUGFIX-WHATSAPP-LEAK-AND-DELIVERY.md A-AC-8 wants steady state >=15%
+    # below the limit; 300 MB under a 768m cap already clears that by a wide margin).
+    # Even un-tightened this hands ~830 MB back to the 1.98 GB box, which also runs
+    # nginx, certbot, the Ops Agent and sshd.
+    #
+    # This VM is cgroup v2, so memswap_limit is honoured without the swapaccount=1
+    # kernel flag that cgroup v1 required.
+    mem_limit: 768m
+    memswap_limit: 768m
+    # shm_size deliberately absent. The old `shm_size: '1gb'` existed for Chromium's
+    # /dev/shm and nothing else. Baileys is a WebSocket client with no shared-memory
+    # surface, so Docker's 64m default is ample — and unlike a 1 GB tmpfs it cannot
+    # quietly charge a gigabyte of page cache against mem_limit.
     expose:
       - "3000"
     volumes:
       - /var/intercessor/data/sqlite.db:/app/sqlite.db
-      - /var/intercessor/data/wwebjs_auth:/app/.wwebjs_auth
+      # Baileys credentials: useMultiFileAuthState writes creds.json plus one small
+      # JSON file per signal key.
+      #
+      # This MUST be a bind mount at exactly /app/.baileys_auth. DEFAULT_AUTH_DIR in
+      # src/lib/whatsapp.ts is that literal path, and clearAuthDir() deliberately
+      # empties the directory rather than removing it, because rmSync on a bind-mount
+      # point fails with EBUSY on Linux — a logout would then silently leave the old
+      # credentials in place. Do not convert this to a named volume and do not change
+      # the container-side path without changing that constant.
+      #
+      # The old `/var/intercessor/data/wwebjs_auth:/app/.wwebjs_auth` line is gone
+      # from here, but the HOST directory is deliberately left on disk untouched, so
+      # the rollback in BAILEYS-MIGRATION-PLAN.md section 8 can re-add this line and
+      # still find its session.
+      - /var/intercessor/data/baileys_auth:/app/.baileys_auth
     environment:
       - NODE_ENV=production
+      # Redundant with DEFAULT_AUTH_DIR in src/lib/whatsapp.ts, and set anyway. This
+      # is the single value whose silent divergence from the volume above costs a QR
+      # scan on EVERY container restart, with no error and no log line to explain it:
+      # the app would happily write credentials to an un-mounted directory inside the
+      # container and lose them on `docker-compose up -d`. Writing it down where the
+      # mount is written down makes that divergence visible in one diff.
+      #
+      # Pinned here rather than in the VM's /var/intercessor/app/.env because this
+      # file is the only thing Cloud Build copies to the VM, so it is versioned and
+      # re-deployed on every push; the .env is not in the repo, is chmod 600, and a
+      # hand-edit there would be lost the next time the VM is rebuilt. Compose's
+      # `environment:` also takes precedence over `env_file:`, so a stale or
+      # hand-edited .env can never override it.
+      - WA_AUTH_PATH=/app/.baileys_auth
     env_file:
       - /var/intercessor/app/.env
     logging:
@@ -57,9 +100,17 @@ services:
       interval: 60s
       timeout: 10s
       retries: 3
-      # Generous on purpose: the WhatsApp session takes 60-90s to load and a short
-      # period would flap the container into unhealthy on every boot.
-      start_period: 180s
+      # 60s, down from 180s. The 180s figure covered whatsapp-web.js booting Chromium
+      # and loading WhatsApp Web, which took 60-90s. This probe only needs the HTTP
+      # server, so what it has to cover is `npm run db:push` plus the Next.js boot —
+      # seconds on this box, not minutes. Baileys connects asynchronously afterwards
+      # and is not on this path at all (the probe hits /api/health, not
+      # /api/health/whatsapp, as reasoned above).
+      #
+      # Exactly one interval of grace: with interval 60s the first probe lands at
+      # ~60s, so this forgives one slow boot and then starts counting. Time to an
+      # honest `unhealthy` drops from ~360s to ~240s (start_period + retries*interval).
+      start_period: 60s
 
   nginx:
     image: nginx:alpine
