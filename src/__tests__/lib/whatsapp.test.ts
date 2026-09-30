@@ -42,6 +42,8 @@ const WATCHDOG_MS = 90_000;
 const SOCKET_END_TIMEOUT_MS = 5_000;
 const LADDER_MS = [5_000, 15_000, 60_000, 300_000, 900_000];
 const DEFAULT_AUTH_DIR = '/app/.baileys_auth';
+/** Raw-frame event carrying the server's ack of one of our outbound messages (S3). */
+const WA_ACK_EVENT = 'CB:ack,class:message';
 
 // --- Mock plumbing ---
 
@@ -64,6 +66,14 @@ function deferred(): Deferred {
     return { promise, resolve, reject };
 }
 
+/** The `sock.ws` emitter Baileys exposes; the service registers its server-ack listener here. */
+interface MockWs {
+    on: (evt: string, h: Handler) => void;
+    /** Actually removes (matched by identity), so a leak test can prove detachment. */
+    off: jest.Mock;
+    removeAllListeners: jest.Mock;
+}
+
 interface MockSocket {
     /** The object handed to the service. */
     sock: {
@@ -72,6 +82,7 @@ interface MockSocket {
             off: jest.Mock;
             removeAllListeners: jest.Mock;
         };
+        ws: MockWs;
         end: jest.Mock;
         logout: jest.Mock;
         sendMessage: jest.Mock;
@@ -85,6 +96,10 @@ interface MockSocket {
      * the socket, which is what the `this.sock !== sock` identity guard exists to survive.
      */
     everRegistered: Registry;
+    /** Live listener table of `sock.ws`. Pruned by off() and removeAllListeners(). */
+    wsHandlers: Registry;
+    /** Every listener ever registered on `sock.ws`, never pruned: the detached-socket delivery path. */
+    wsEverRegistered: Registry;
     end: jest.Mock;
     logout: jest.Mock;
 }
@@ -147,6 +162,8 @@ function createMockState(opts: LoadOptions): MockState {
         saveCreds: [],
         sockEnd: jest.fn().mockResolvedValue(undefined),
         sockLogout: jest.fn().mockResolvedValue(undefined),
+        // Default resolves with NO message key, which exercises spec 3.14. S3 tests that expect
+        // a real send set mockResolvedValue({ key: { id, remoteJid, fromMe: true } }) themselves.
         sockSend: jest.fn().mockResolvedValue(undefined),
         fsExists: jest.fn(() => true),
         fsReaddir: jest.fn(() => [...state.authFiles]),
@@ -174,6 +191,8 @@ function createMockState(opts: LoadOptions): MockState {
             state.makeOptions.push(options);
             const handlers: Registry = {};
             const everRegistered: Registry = {};
+            const wsHandlers: Registry = {};
+            const wsEverRegistered: Registry = {};
             const end = jest.fn((e?: unknown) => state.sockEnd(e));
             const logout = jest.fn(() => state.sockLogout());
             const sock = {
@@ -188,12 +207,28 @@ function createMockState(opts: LoadOptions): MockState {
                         delete handlers[evt];
                     }),
                 },
+                ws: {
+                    on: (evt: string, h: Handler) => {
+                        (wsHandlers[evt] ||= []).push(h);
+                        (wsEverRegistered[evt] ||= []).push(h);
+                    },
+                    off: jest.fn((evt: string, h: Handler) => {
+                        const live = wsHandlers[evt];
+                        if (!live) return;
+                        const at = live.indexOf(h);
+                        if (at >= 0) live.splice(at, 1);
+                        if (live.length === 0) delete wsHandlers[evt];
+                    }),
+                    removeAllListeners: jest.fn((evt: string) => {
+                        delete wsHandlers[evt];
+                    }),
+                },
                 end,
                 logout,
                 sendMessage: state.sockSend,
                 user: undefined,
             };
-            state.sockets.push({ sock, handlers, everRegistered, end, logout });
+            state.sockets.push({ sock, handlers, everRegistered, wsHandlers, wsEverRegistered, end, logout });
             return sock;
         }),
     };
@@ -281,6 +316,45 @@ function emitLate(state: MockState, index: number, evt: string, payload: unknown
 
 const conn = (state: MockState, index: number, payload: unknown) =>
     emit(state, index, 'connection.update', payload);
+
+/** Like emit(), for the `sock.ws` emitter. Throws if nothing is listening (a test bug). */
+function wsEmit(state: MockState, index: number, evt: string, payload: unknown): void {
+    const live = [...(state.sockets[index].wsHandlers[evt] ?? [])];
+    if (live.length === 0) throw new Error(`test bug: socket ${index} has no live ws '${evt}' listener`);
+    live.forEach((h) => h(payload));
+}
+
+/** Like emitLate(), for the `sock.ws` emitter: reaches listeners the service has already removed. */
+function wsEmitLate(state: MockState, index: number, evt: string, payload: unknown): void {
+    const all = state.sockets[index].wsEverRegistered[evt] ?? [];
+    if (all.length === 0) throw new Error(`test bug: socket ${index} never registered ws '${evt}'`);
+    all.forEach((h) => h(payload));
+}
+
+interface AckSpec {
+    id: string;
+    /** Defaults to a group jid. Baileys reads it as the chat; the service must not require it. */
+    from?: string;
+    /** Present only on a failure ack, as a stringified numeric code (e.g. '403'). */
+    error?: string;
+}
+
+const ackNode = ({ id, from, error }: AckSpec) => ({
+    tag: 'ack',
+    attrs: { id, class: 'message', from: from ?? '120363000000000000@g.us', ...(error ? { error } : {}) },
+});
+
+/** The server's `<ack class="message">` for one of our sends, delivered to the LIVE ws listener. */
+const serverAck = (state: MockState, index: number, spec: AckSpec) =>
+    wsEmit(state, index, WA_ACK_EVENT, ackNode(spec));
+
+/** The same ack delivered through `wsEverRegistered`: reaches a socket the service has detached. */
+const lateServerAck = (state: MockState, index: number, spec: AckSpec) =>
+    wsEmitLate(state, index, WA_ACK_EVENT, ackNode(spec));
+
+/** Fires `messages.update` at a socket's live listeners. The payload is an array of { key, update }. */
+const msgUpdate = (state: MockState, index: number, updates: unknown) =>
+    emit(state, index, 'messages.update', updates);
 
 /**
  * Indices of the sockets whose events actually reach the service. Probes each socket (live or
@@ -569,40 +643,6 @@ describe('frozen facade: getStatus()', () => {
 
         conn(state, 0, closeWith(408));
         expect(svc.isConnected()).toBe(false);
-    });
-});
-
-describe('frozen facade: sendMessage() is an S2 stub', () => {
-    it('resolves false and never touches the socket, even when connected', async () => {
-        const { svc, state } = await loadPaired();
-        conn(state, 0, { connection: 'open' });
-
-        const result = await svc.sendMessage('120363000000000000@g.us', 'a prayer');
-
-        expect(result).toBe(false);
-        expect(state.sockSend).not.toHaveBeenCalled();
-        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('not implemented until S3'));
-    });
-
-    it('resolves false with no socket at all, and does not re-arm initialize()', async () => {
-        const { svc, state } = await loadPaired();
-        conn(state, 0, closeWith(401)); // stand down, no socket
-        const socketsBefore = state.makeWASocket.mock.calls.length;
-
-        const result = await svc.sendMessage('120363000000000000@g.us', 'a prayer');
-        await flush();
-
-        expect(result).toBe(false);
-        expect(state.makeWASocket).toHaveBeenCalledTimes(socketsBefore);
-    });
-
-    it('exports a Promise-returning function of arity 2 (signature frozen)', async () => {
-        const { svc } = await loadPaired();
-
-        const pending = svc.sendMessage('x@g.us', 'y');
-        expect(pending).toBeInstanceOf(Promise);
-        await pending;
-        expect(svc.sendMessage.length).toBe(2);
     });
 });
 

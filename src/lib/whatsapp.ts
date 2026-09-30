@@ -52,8 +52,104 @@ const SOCKET_END_TIMEOUT_MS = 5_000;
 /** Device label shown in the phone's Linked Devices list. */
 const WA_BROWSER: [string, string, string] = ['TribePrayer', 'Chrome', '1.0.0'];
 
+/**
+ * proto.WebMessageInfo.Status, mirrored from @whiskeysockets/baileys
+ * (WAProto/WAProto.proto:5240-5247, re-exported as WAMessageStatus in
+ * lib/Types/Message.d.ts:32). Declared locally rather than imported so the values
+ * stay available even when the library is mocked — same reasoning as the WA_* close
+ * codes above.
+ *
+ * NOTE THE TRAP: ERROR is 0, not -1. whatsapp-web.js used -1, so the old code could
+ * get away with truthiness; here a falsy check would silently swallow the one status
+ * that means "WhatsApp rejected this". Compare explicitly, never with `!status`.
+ */
+const WA_STATUS_ERROR = 0;
+/* eslint-disable @typescript-eslint/no-unused-vars -- the full enum is mirrored for the reader; only ERROR and the SERVER_ACK threshold are compared, and PENDING (1) is the local pre-send state, deliberately not decisive. */
+const WA_STATUS_PENDING = 1;
+const WA_STATUS_SERVER_ACK = 2;   // the acceptance threshold
+const WA_STATUS_DELIVERY_ACK = 3;
+const WA_STATUS_READ = 4;
+const WA_STATUS_PLAYED = 5;
+/* eslint-enable @typescript-eslint/no-unused-vars */
+
+/**
+ * Raw-frame event for the server's acknowledgement of one of our outbound message
+ * stanzas. Baileys dispatches `CB:<tag>,<attr>:<value>` for every received binary node
+ * (lib/Socket/socket.js:458-462) and subscribes to this exact string itself for its
+ * bad-ack handler (lib/Socket/messages-recv.js:1624). This is the ONLY positive
+ * "WhatsApp accepted it" signal that exists for a group send: for a group jid,
+ * messages.update never carries a status (handleReceipt routes group receipts to
+ * message-receipt.update instead).
+ */
+const WA_ACK_EVENT = 'CB:ack,class:message';
+
+/**
+ * How long to wait for a decisive ack after the message id is known.
+ * 20s, down from master's 30s: api/submit awaits sendMessage() once per configured
+ * group, serially, inside one HTTP request that nginx abandons at 62s. The worst case
+ * must stay under that for a realistic group count, so the budget is
+ * (relay 10s + ack 20s) x 2 groups = 60s. Baileys acks a healthy send in well under a
+ * second; 20s is already ~20x headroom. Overridable by WA_ACK_TIMEOUT_MS (the same name
+ * master used, so an existing deployment override keeps working).
+ */
+const DEFAULT_ACK_TIMEOUT_MS = 20_000;
+
+/**
+ * Ceiling on sock.sendMessage() itself. Unbounded, it is not: a group send whose
+ * metadata is not cached issues an iq query through query() -> waitForMessage(), whose
+ * default timeout is defaultQueryTimeoutMs = 60_000 (lib/Defaults/index.js:56). One
+ * such send plus the ack wait would exceed nginx's 62s and 504 a submission whose DB row
+ * was already written. Overridable by WA_SEND_RELAY_TIMEOUT_MS.
+ */
+const DEFAULT_RELAY_TIMEOUT_MS = 10_000;
+
+/**
+ * Outcomes that arrived before sendMessage() had registered its waiter. Bounded,
+ * because an unbounded cache on a long-lived singleton is a slow memory leak, and this
+ * box has already died twice of resource exhaustion. Same bound and FIFO eviction as
+ * master's earlyAcks.
+ */
+const MAX_EARLY_ACKS = 200;
+
+/**
+ * Hard cap on concurrent ack waiters. Each entry lives at most WA_ACK_TIMEOUT_MS and is
+ * removed by its own settle, so this is a backstop against a wedged settle path rather
+ * than an expected limit; a prayer wall does not get 100 simultaneous submissions, and if
+ * it does, shedding load on a 2 GB box is the right answer.
+ */
+const MAX_PENDING_SENDS = 100;
+
+/**
+ * Floor between two send-triggered re-arms. Distinct from the failure ladder because a
+ * send-driven re-arm is not a failure and must not show up in getStatus()'s
+ * nextInitAllowedAt, which the admin UI renders. See rearmAfterDisconnectedSend().
+ */
+const SEND_REARM_MIN_INTERVAL_MS = 60_000;
+
 /** Minimal shape of a Baileys close error (a @hapi/boom instance at runtime). */
 type DisconnectError = Error & { output?: { statusCode?: number } };
+
+/** Minimal shape of the WAMessage returned by sock.sendMessage(). */
+type SentMessage = { key?: { id?: string | null } };
+
+/** Minimal shape of a `CB:ack,class:message` binary node. */
+type AckNode = { attrs?: Record<string, string | undefined> };
+
+/** Minimal shape of one element of a messages.update payload. */
+type MessageStatusUpdate = {
+    key?: { id?: string | null };
+    update?: { status?: number | string | null };
+};
+
+/**
+ * Why a send stopped waiting.
+ *  accepted  - WhatsApp acked the exact message id, or reported status >= SERVER_ACK.
+ *  rejected  - WhatsApp reported an error for that id (bad ack attr, or status ERROR).
+ *  timeout   - nothing decisive arrived within the ack budget.
+ *  abandoned - the socket went away (close, watchdog, logout, shutdown).
+ * Only 'accepted' maps to sendMessage() returning true.
+ */
+type SendOutcome = 'accepted' | 'rejected' | 'timeout' | 'abandoned';
 
 /** Non-mutating snapshot of the client lifecycle, for routes that must report. */
 export type WhatsAppStatus = {
@@ -118,6 +214,48 @@ class WhatsAppService {
 
     /** Epoch ms before which a non-forced initialize() is refused. 0 = no backoff. */
     private nextInitAllowedAt: number = 0;
+
+    /**
+     * Outgoing messages awaiting a decisive outcome, keyed by Baileys message id
+     * (fullMsg.key.id). A map, not a field: two routes can send concurrently and
+     * api/submit loops over several groups. Bounded by MAX_PENDING_SENDS at the
+     * sendMessage() entry, and every entry is removed by its own settle() or by
+     * settleAllPendingSends().
+     */
+    private pendingSends: Map<string, (outcome: SendOutcome) => void> = new Map();
+
+    /**
+     * Outcomes that arrived before their waiter was registered — the early-ack race is
+     * real here: sock.sendMessage() only resolves after relayMessage() has awaited the
+     * ws write, and the server's ack can land on the socket while that continuation is
+     * still queued as a microtask. Bounded three ways: FIFO-evicted at MAX_EARLY_ACKS,
+     * only written while inFlightSends > 0, and cleared wholesale on every detach.
+     */
+    private earlyAcks: Map<string, SendOutcome> = new Map();
+
+    /**
+     * Sends between "about to call sock.sendMessage()" and "done with the ack wait".
+     * Gates earlyAcks: with no send in flight, an inbound ack for an id we are not
+     * waiting on is somebody else's business and is dropped rather than cached.
+     */
+    private inFlightSends: number = 0;
+
+    /**
+     * The `CB:ack,class:message` listener currently registered on this.sock.ws, kept so
+     * detachSocket() can remove exactly ours. sock.end() removes only ws's 'close',
+     * 'open' and 'message' listeners (lib/Socket/socket.js:481-483), so unlike the
+     * sock.ev listeners this one is NOT cleaned up by the library and would leak into
+     * `this` on every reconnect. removeAllListeners(WA_ACK_EVENT) is deliberately not
+     * used: Baileys registers its own bad-ack handler on the same event.
+     */
+    private ackHandler: ((node: unknown) => void) | null = null;
+
+    /** Epoch ms before which a send-triggered re-arm is suppressed. 0 = none. */
+    private nextSendRearmAllowedAt: number = 0;
+
+    /** Read once at construction so a test can set the env before importing. */
+    private readonly ackTimeoutMs: number = Number(process.env.WA_ACK_TIMEOUT_MS) || DEFAULT_ACK_TIMEOUT_MS;
+    private readonly relayTimeoutMs: number = Number(process.env.WA_SEND_RELAY_TIMEOUT_MS) || DEFAULT_RELAY_TIMEOUT_MS;
 
     /** Resolved once in the constructor so tests can set WA_AUTH_PATH before import. */
     private readonly authDir: string;
@@ -239,7 +377,7 @@ class WhatsAppService {
      * never re-read from `this`: each initialize() produces a fresh
      * { state, saveCreds } pair and they must not be crossed.
      *
-     * The `this.sock !== sock` guard on both handlers is the backstop for a socket
+     * The `this.sock !== sock` guard on every handler is the backstop for a socket
      * that has been replaced or discarded. On creds.update it is not cosmetic: a
      * discarded socket flushing stale creds into the shared auth directory would
      * corrupt the live session's keys.
@@ -250,6 +388,175 @@ class WhatsAppService {
             void saveCreds().catch((err) => console.error('[WA:auth] Failed to persist credentials:', err));
         });
         sock.ev.on('connection.update', (u) => this.onConnectionUpdate(sock, u));
+        sock.ev.on('messages.update', (updates) => this.onMessagesUpdate(sock, updates as MessageStatusUpdate[]));
+
+        // The raw ack listener lives on sock.ws, not sock.ev — see WA_ACK_EVENT.
+        // Assign the field BEFORE registering, so a throw from ws.on() still leaves
+        // detachSocket() able to remove it (off() on an unregistered handler is a no-op).
+        const handler = (node: unknown) => this.onServerAck(sock, node as AckNode);
+        this.ackHandler = handler;
+        if (typeof sock.ws?.on === 'function') {
+            sock.ws.on(WA_ACK_EVENT, handler);
+        } else {
+            // Cannot happen against the real library (ws is a public member of WASocket,
+            // lib/Socket/index.d.ts:216). Fail loudly rather than silently degrade: without
+            // this listener no group send can ever be confirmed, and silence would look
+            // exactly like the July outage.
+            this.ackHandler = null;
+            console.error('[WA:send] Socket exposes no ws emitter; server acks cannot be observed and every send will report as unconfirmed.');
+        }
+    }
+
+    /**
+     * WhatsApp's server acknowledged (or refused) one of our outbound message stanzas.
+     * `<ack class="message" id="…" [error="…"]>`: the error attribute is absent on
+     * success and a stringified numeric code on failure, mirroring Baileys' own
+     * handleBadAck (lib/Socket/messages-recv.js:1511).
+     *
+     * Matching is on attrs.id ONLY. attrs.from is never required: WhatsApp's addressing
+     * has both PN and LID forms and a `from` comparison would turn an addressing change
+     * into "every send fails". The ids are per-send unique values minted by
+     * generateMessageIDV2, so id equality is already exact.
+     */
+    private onServerAck(sock: WASocket, node: AckNode): void {
+        if (this.sock !== sock) return;
+        const attrs = node?.attrs;
+        const id = attrs?.id;
+        if (!id) return;
+        const error = attrs?.error;
+        this.recordSendOutcome(id, error ? 'rejected' : 'accepted', error ? `server ack error=${error}` : 'server ack');
+    }
+
+    /**
+     * For a DIRECT chat, Baileys turns receipts into messages.update with a status. For a
+     * group it never does (see WA_ACK_EVENT), so this is a secondary signal and, for a
+     * group, only ever carries a failure (handleBadAck's status: ERROR).
+     */
+    private onMessagesUpdate(sock: WASocket, updates: MessageStatusUpdate[]): void {
+        if (this.sock !== sock) return;
+        if (!Array.isArray(updates)) return;   // the payload is an array; defend against a mock or a library change
+        for (const u of updates) {
+            const id = u?.key?.id;
+            if (!id) continue;
+            const raw = u?.update?.status;
+            // NOT `if (!raw)`: WA_STATUS_ERROR is 0. Absent status means this update is
+            // about something else entirely (an edit, a revoke, a poll vote) and is not
+            // ours to judge.
+            if (raw === undefined || raw === null) continue;
+            const status = Number(raw);
+            if (Number.isNaN(status)) continue;
+            if (status === WA_STATUS_ERROR) {
+                this.recordSendOutcome(id, 'rejected', 'status=ERROR');
+            } else if (status >= WA_STATUS_SERVER_ACK) {
+                this.recordSendOutcome(id, 'accepted', `status=${status}`);
+            }
+            // WA_STATUS_PENDING (1) is the local pre-send state and is not decisive: keep waiting.
+        }
+    }
+
+    /**
+     * Routes a decisive outcome for `id` to its waiter, or buffers it if the waiter has
+     * not registered yet.
+     */
+    private recordSendOutcome(id: string, outcome: 'accepted' | 'rejected', why: string): void {
+        const settle = this.pendingSends.get(id);
+        if (settle) {
+            console.log(`[WA:send] ${outcome === 'accepted' ? 'Acknowledged' : 'Rejected'} id=${id} (${why}).`);
+            settle(outcome);          // settle() removes its own map entry and clears its timer
+            return;
+        }
+        // Nobody is waiting. Either the outcome beat its waiter's registration (the
+        // early-ack race), or it belongs to a send that already timed out or was
+        // abandoned, or to a message we never sent at all.
+        if (this.inFlightSends === 0) return;   // nothing is or will be waiting: drop it
+        const buffered = this.earlyAcks.get(id);
+        // First outcome wins, with one exception: a rejection may overwrite a buffered
+        // acceptance, never the reverse. Evidence that WhatsApp refused the message is
+        // stronger than evidence that it accepted it, and this project has already
+        // shipped a false success claim once.
+        if (buffered === 'rejected' || (buffered !== undefined && outcome === 'accepted')) return;
+        if (buffered === undefined && this.earlyAcks.size >= MAX_EARLY_ACKS) {
+            const oldest = this.earlyAcks.keys().next().value;
+            if (oldest !== undefined) this.earlyAcks.delete(oldest);
+        }
+        this.earlyAcks.set(id, outcome);
+    }
+
+    /**
+     * Resolves with the first decisive outcome for `id`, or 'timeout' after the ack
+     * budget. Never rejects. Resolves exactly once: settle deletes the map entry before
+     * resolving, so a second outcome for the same id finds nothing in pendingSends, and
+     * resolving a settled promise is a no-op regardless.
+     */
+    private waitForSendConfirmation(id: string): Promise<SendOutcome> {
+        const early = this.earlyAcks.get(id);
+        if (early !== undefined) {
+            this.earlyAcks.delete(id);
+            return Promise.resolve(early);
+        }
+        return new Promise<SendOutcome>((resolve) => {
+            const settle = (outcome: SendOutcome) => {
+                clearTimeout(timer);
+                this.pendingSends.delete(id);
+                resolve(outcome);
+            };
+            // unref so a pending ack wait cannot hold the Node event loop open through a
+            // shutdown; `?.` because Jest's fake timer handles have no unref (established
+            // pattern, see scheduleReconnect()).
+            const timer: ReturnType<typeof setTimeout> = setTimeout(() => settle('timeout'), this.ackTimeoutMs);
+            timer.unref?.();
+            this.pendingSends.set(id, settle);
+        });
+    }
+
+    /**
+     * Fails every in-flight send now, with the lifecycle event that killed it in the
+     * log. Synchronous and cannot throw (the settle closures only touch a map and
+     * resolve a promise; the awaiting continuations run later as microtasks).
+     */
+    private settleAllPendingSends(reason: string): void {
+        const count = this.pendingSends.size;
+        for (const settle of [...this.pendingSends.values()]) settle('abandoned');
+        this.pendingSends.clear();   // belt and braces; each settle() already removed its own entry
+        this.earlyAcks.clear();
+        if (count > 0) {
+            console.warn(`[WA:send] Settled ${count} in-flight send(s) as unconfirmed: ${reason}.`);
+        }
+    }
+
+    /**
+     * A send arrived with no open socket. Reports nothing to the caller (sendMessage()
+     * returns false itself) but asks for a bounded re-initialization so the next send
+     * has a chance. Master re-armed from sendMessage() with no floor at all, which is
+     * how a failing client got relaunched every 5s for as long as an admin page was
+     * open. S2 added the ladder; this keeps send-driven re-arms inside it and adds a
+     * floor for the two states the ladder does not cover.
+     */
+    private rearmAfterDisconnectedSend(): void {
+        if (this.isShuttingDown) return;
+        // Somebody is already on it.
+        if (this.isReady || this.isInitializing) return;
+        // A scheduled reconnect owns recovery; it is force:true and will not be blocked by
+        // any window, so re-arming here would only risk a second socket.
+        if (this.reconnectTimer) return;
+        const now = Date.now();
+        // The failure ladder owns recovery. initialize() would no-op at its own window
+        // check anyway; returning here keeps the log quiet, which is the point of backoff.
+        if (now < this.nextInitAllowedAt) return;
+        // And a floor of our own, so traffic cannot drive one socket per submission
+        // through the states that record no failure and arm no timer: an unpaired QR that
+        // nobody scanned (close with wasRegistered false), or a 401/403/411 stand-down
+        // after the creds were wiped. Kept separate from nextInitAllowedAt so getStatus()
+        // keeps reporting only real failure backoff to the admin UI.
+        if (now < this.nextSendRearmAllowedAt) return;
+        this.nextSendRearmAllowedAt = now + SEND_REARM_MIN_INTERVAL_MS;
+        console.log('[WA:send] Not connected; requesting a re-initialization.');
+        // Floating promise, non-forced. Non-forced is deliberate: force:true would bypass
+        // the backoff ladder, and submission traffic is exactly the thing that must not be
+        // able to do that. There is no process-wide unhandledRejection handler, so the
+        // catch is mandatory — an unswallowed rejection here would take down the whole
+        // server.
+        void this.initialize().catch((err) => console.error('[WA:send] Re-initialization failed:', err));
     }
 
     /**
@@ -287,6 +594,7 @@ class WhatsAppService {
             this.latestQR = null;
             this.consecutiveInitFailures = 0;
             this.nextInitAllowedAt = 0;
+            this.nextSendRearmAllowedAt = 0;
             return;
         }
 
@@ -311,7 +619,7 @@ class WhatsAppService {
         this.isReady = false;
         this.isInitializing = false;
         this.latestQR = null;
-        this.detachSocket(sock);
+        this.detachSocket(sock, `the socket closed (statusCode=${statusCode ?? 'none'})`);
         this.sock = null;
 
         console.warn(`[WA:conn] Socket closed. statusCode=${statusCode ?? 'none'} reason=${reason}`);
@@ -376,15 +684,30 @@ class WhatsAppService {
         this.scheduleReconnect(backoffMs);
     }
 
-    /** Cuts a socket loose from this service. Synchronous, never throws. */
-    private detachSocket(sock: WASocket): void {
+    /**
+     * Cuts a socket loose from this service. Synchronous, never throws. `reason` names
+     * the lifecycle event for the log line of any send it abandons.
+     */
+    private detachSocket(sock: WASocket, reason = 'the socket was detached'): void {
         // Belt and braces alongside the identity guard: end() removes connection.update
         // itself, but a socket discarded WITHOUT end() completing (a throw in
         // openSocket() after attach()) would otherwise keep listeners into `this`.
         try {
             sock.ev.removeAllListeners('connection.update');
             sock.ev.removeAllListeners('creds.update');
+            sock.ev.removeAllListeners('messages.update');
         } catch { /* a socket already ev.destroy()'d throws nothing useful */ }
+        if (this.ackHandler) {
+            // off(), not removeAllListeners(WA_ACK_EVENT): Baileys' own bad-ack handler is
+            // registered on the same event, and sock.end() does not remove it either.
+            try { sock.ws?.off?.(WA_ACK_EVENT, this.ackHandler); } catch { /* emitter already gone */ }
+            this.ackHandler = null;
+        }
+        // A send waiting on an ack from a socket that is going away must fail now, not in
+        // 20s. This is the ONE call site that guarantees all four lifecycle paths that
+        // drop a socket (onClose, teardownSocket, logout, shutdown) settle their sends:
+        // they all funnel through here, so no future path can forget it.
+        this.settleAllPendingSends(reason);
     }
 
     /**
@@ -398,7 +721,7 @@ class WhatsAppService {
         this.latestQR = null;
         this.clearConnectWatchdog();
         if (sock) {
-            this.detachSocket(sock);
+            this.detachSocket(sock, 'the socket was torn down');
             // sock.end takes `Error | undefined`, so undefined must be passed explicitly.
             void sock.end(undefined).catch(() => { /* already dead; nothing to reclaim */ });
         }
@@ -644,12 +967,16 @@ class WhatsAppService {
             this.clearConnectWatchdog();
             const sock = this.sock;
             this.sock = null;
+            // Unconditional, not inside the `if (sock)`: this.sock can be null here (a
+            // 401 stand-down) and no detach would run. Idempotent with the one inside
+            // detachSocket(): the second call finds nothing and logs nothing.
+            this.settleAllPendingSends(`${signal} shutdown`);
             if (sock) {
                 // Detach BEFORE ending so the resulting close event cannot re-enter and
                 // schedule a reconnect on the way out (isShuttingDown is a second guard
                 // on the same thing). end(), never logout(): a container restart must
                 // not unlink the device.
-                this.detachSocket(sock);
+                this.detachSocket(sock, `${signal} shutdown`);
                 await this.endSocket(sock, false);
             }
 
@@ -664,16 +991,138 @@ class WhatsAppService {
     }
 
     /**
-     * S2 stub: correct signature, no behaviour. Sending and delivery-ack tracking
-     * arrive in S3, built on Baileys' messages.update. Returning false (never true)
-     * means callers record whatsappSent = false rather than claiming a delivery that
-     * did not happen.
+     * Sends `message` to `chatId` and resolves true ONLY once WhatsApp itself has
+     * acknowledged that exact message id.
+     *
+     * Signature and semantics are frozen: api/submit and api/admin/prayers/resend both do
+     * `const sent = await whatsappService?.sendMessage(target, text)` and write
+     * whatsappSent = true only when every target returned truthy.
+     *
+     * Deliberately NOT treated as success:
+     *  - sock.sendMessage() resolving. That means the stanza reached the TCP socket
+     *    (sendRawMessage awaits the ws.send callback, nothing more). The July outage was
+     *    caused by trusting exactly this class of signal; an earlier analysis then
+     *    concluded sends worked while every message sat at ack 0 forever.
+     *  - the local echo on messages.upsert, which Baileys emits from its own
+     *    upsertMessage() with no server involvement at all.
+     *  - status PENDING (1), which is the message's initial local state.
+     *  - the `status` field of the WAMessage that sock.sendMessage() returns: it is set
+     *    locally to PENDING before the stanza is even encrypted.
      */
     public async sendMessage(chatId: string, message: string): Promise<boolean> {
-        console.warn(
-            `[WA:send] sendMessage() is not implemented until S3 — dropping ${message.length} chars for ${chatId}.`,
-        );
-        return false;
+        const sock = this.sock;
+
+        // 1. Not connected: no socket to send on. Report failure and ask for a bounded re-arm.
+        if (!this.isReady || !sock) {
+            console.warn(`[WA:send] Not connected (ready=${this.isReady}, socket=${!!sock}). Not sending ${message.length} chars to ${chatId}.`);
+            this.rearmAfterDisconnectedSend();
+            return false;
+        }
+
+        // 2. Cheap input guard. relayMessage() destructures jidDecode(jid) directly
+        // (lib/Socket/messages-send.js:434) and jidDecode returns undefined for a string
+        // with no '@' (lib/WABinary/jid-utils.js:30-35), so a malformed chat id fails as
+        // an opaque TypeError from library internals. Naming it here costs one line and
+        // makes the log actionable: the value comes from the whatsapp_group_ids app
+        // setting, typed by an admin.
+        if (!chatId.includes('@')) {
+            console.error(`[WA:send] Refusing to send: "${chatId}" is not a WhatsApp jid (expected user@s.whatsapp.net or id@g.us).`);
+            return false;
+        }
+
+        // 3. Backstop bound, not an expected limit.
+        if (this.pendingSends.size >= MAX_PENDING_SENDS) {
+            console.error(`[WA:send] ${this.pendingSends.size} sends already awaiting acknowledgement (cap ${MAX_PENDING_SENDS}). Shedding this one.`);
+            return false;
+        }
+
+        this.inFlightSends++;
+        try {
+            // 4. Relay, bounded. linkPreview: null is load-bearing, not cosmetic: for
+            // { text } with linkPreview undefined, generateWAMessageContent calls
+            // generateLinkPreviewIfRequired (lib/Utils/messages.js:278-281), which fetches
+            // any https:// URL found in the text via link-preview-js. The text here is
+            // anonymous, unvalidated, user-submitted prayer content, so leaving it
+            // undefined turns every submission into an outbound HTTP request from the
+            // production box, chosen by whoever filled in the form. null skips it
+            // entirely; WAUrlInfo | null is the declared type (lib/Types/Message.d.ts:172).
+            let sent: SentMessage | undefined;
+            let relayTimedOut = false;
+            const relay = sock.sendMessage(chatId, { text: message, linkPreview: null }) as Promise<SentMessage | undefined>;
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            try {
+                sent = await Promise.race([
+                    relay,
+                    new Promise<never>((_, reject) => {
+                        timer = setTimeout(() => {
+                            relayTimedOut = true;
+                            reject(new Error(`sock.sendMessage() did not settle within ${this.relayTimeoutMs}ms`));
+                        }, this.relayTimeoutMs);
+                        timer.unref?.();
+                    }),
+                ]);
+            } catch (err) {
+                // A send to a chat the account has left, an invalid jid, a socket that
+                // closed between the isReady check and here (sendRawMessage throws Boom
+                // 'Connection Closed' / 428 when !ws.isOpen), a group metadata query that
+                // timed out — all land here, all mean "not sent".
+                console.error(`[WA:send] sock.sendMessage() failed for ${chatId}:`, err);
+                // The abandoned promise must not become an unhandledRejection, and if it
+                // later succeeds an operator needs to know a message went out that we
+                // recorded as unsent. Diagnostic only: the boolean has already been decided.
+                if (relayTimedOut) {
+                    relay.then(
+                        (late) => console.error(`[WA:send] A send to ${chatId} completed AFTER its ${this.relayTimeoutMs}ms deadline (id=${late?.key?.id ?? 'unknown'}). It is recorded as NOT sent; the group may show it.`),
+                        (lateErr) => console.warn(`[WA:send] The abandoned send to ${chatId} later failed:`, lateErr),
+                    );
+                }
+                return false;
+            } finally {
+                if (timer) clearTimeout(timer);
+            }
+
+            // 5. The socket was replaced while we were relaying (a close, the watchdog, an
+            // admin logout). Our waiter is not registered yet and settleAllPendingSends()
+            // has already run and cleared earlyAcks, so registering now would just burn the
+            // full ack budget waiting for a socket that no longer exists. Fail immediately
+            // instead.
+            if (this.sock !== sock) {
+                console.warn(`[WA:send] The socket was replaced while sending to ${chatId}; the outcome is unknown. Recording as not sent.`);
+                return false;
+            }
+
+            // 6. No id, no confirmation possible. sendMessage()'s declared return type is
+            // WAMessage | undefined; the undefined branch is the disappearingMessagesInChat
+            // group-settings path (lib/Socket/messages-send.js:1055-1067), which { text }
+            // never takes — but the type says it can, so it is handled rather than
+            // asserted away. This is also the closest thing to the July failure: the ONE
+            // field we need is missing. It must log loudly and report false, never true.
+            const id = sent?.key?.id;
+            if (!id) {
+                console.error(`[WA:send] sock.sendMessage() returned no message key for ${chatId}; delivery cannot be confirmed. Recording as not sent.`);
+                return false;
+            }
+
+            // 7. Wait for WhatsApp.
+            const outcome = await this.waitForSendConfirmation(id);
+
+            if (outcome === 'accepted') {
+                console.log(`[WA:send] WhatsApp accepted the message to ${chatId} (id=${id}).`);
+                return true;
+            }
+            if (outcome === 'rejected') {
+                console.error(`[WA:send] WhatsApp REJECTED the message to ${chatId} (id=${id}). Check the chat id is valid and this account is still a participant.`);
+                return false;
+            }
+            if (outcome === 'timeout') {
+                console.error(`[WA:send] No acknowledgement from WhatsApp for ${chatId} (id=${id}) within ${this.ackTimeoutMs}ms. Treating as not sent.`);
+                return false;
+            }
+            console.warn(`[WA:send] The send to ${chatId} (id=${id}) was abandoned before WhatsApp acknowledged it. Treating as not sent.`);
+            return false;
+        } finally {
+            this.inFlightSends--;
+        }
     }
 
     public async logout(): Promise<boolean> {
@@ -717,19 +1166,24 @@ class WhatsAppService {
         }
 
         this.sock = null;
-        if (sock) this.detachSocket(sock);
+        if (sock) this.detachSocket(sock, 'an admin logout');
 
         this.isReady = false;
         this.isInitializing = false;
         this.latestQR = null;
+        // Unconditional: `sock` can be null here (logout after a 401 stand-down) and the
+        // detach above is then skipped. Idempotent with the one inside detachSocket().
+        this.settleAllPendingSends('an admin logout');
 
         // Wipe credentials so the next socket issues a fresh QR.
         this.clearAuthDir();
 
         // An admin logout is not a failure, and must not leave the re-arm sitting
-        // inside a 15-minute backoff window.
+        // inside a 15-minute backoff window. The same goes for the send-triggered
+        // re-arm floor: a logout makes the previous throttle stale.
         this.consecutiveInitFailures = 0;
         this.nextInitAllowedAt = 0;
+        this.nextSendRearmAllowedAt = 0;
 
         // Belt-and-braces, deliberately placed AFTER the detach above: the loggedOut
         // close normally consumes this flag, but if sock.logout() threw or timed out,
