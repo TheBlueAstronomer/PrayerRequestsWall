@@ -647,6 +647,61 @@ so `WA_ACK_TIMEOUT_MS` likely has to rise alongside it.
 
 ---
 
+## 7d. CONFIRMED in production (2026-09-30, after the QR scan)
+
+**The open premise from section 7b is settled: WhatsApp does emit `<ack class="message">`
+without an error attribute for an accepted GROUP send.** The contingency
+(`message-receipt.update` as a third accept signal) is **not needed** and should not be added.
+
+Evidence, from the production container log after pairing:
+
+```
+[WA:auth] Pairing accepted. Session established.
+[WA:ready] Socket open. Session established.
+[WA:send] Acknowledged id=3EB055FAE8983CC5C33090 (server ack).
+[WA:send] WhatsApp accepted the message to 919886160464-1565807006@g.us (id=3EB055FAE8983CC5C33090)
+```
+
+Counts over the session: **1 acknowledged, 1 accepted, 0 unacknowledged, 0 rejected, 0 past
+the relay deadline.** `WhatsApp accepted the message` only logs on the `accepted` branch, so
+`sendMessage()` returned `true` from a real server ack rather than from anything local.
+
+This also retires the standing S6 warning: sends are being confirmed correctly, not silently
+under-reported, so the "do not press Resend" caution does not apply to the current build.
+
+### Measured with a live, paired session
+
+| | whatsapp-web.js | Baileys, paired |
+|---|---|---|
+| Container memory | 0.9-1.4 GB | **319.5 MB of a 768 MB cap (41.6%)** |
+| Host free memory | ~80-95 MB | **743 MB** |
+| Chromium processes | 6-8 per browser | **0** |
+| Zombie processes | ~2 per 5s under load | **0** |
+| Swap | climbing to 100% over ~2 weeks | 68 MB, flat |
+
+Load average 0.20. The 768m cap has roughly 2.4x headroom over a live session, so the
+"tighten to 512m" note remains safe but unnecessary.
+
+### Session persistence confirmed
+
+`/var/intercessor/data/baileys_auth` holds **838 files, 3.4 MB** after pairing, mostly
+`app-state-sync-key-*.json`. The session therefore survives a container restart with no
+re-scan. Note this is the F11 disk item from the S3 review made concrete: the directory went
+from 0 to 838 files on a single pairing. It should plateau after the initial app-state sync,
+but it is a new directory that only grows on a box that has died of a full disk once, so the
+`du -sh` / file-count check in `DEPLOYMENT.md` is worth actually running.
+
+### Still not exercised end-to-end
+
+The confirmed send went to the **test** group, and that route deliberately does not touch
+`whatsapp_sent`. The first real submission through the site to
+`120363424883283508@g.us` will complete the picture. The code path is identical — same
+`sendMessage()`, same ack listener, same `@g.us` group shape — so the remaining risk is low,
+but `whatsapp_sent` being written by the new code is not yet directly observed. The 10 rows
+currently at `whatsapp_sent=1` are historical, from before the July breakage.
+
+---
+
 ## 8. Rollback
 
 The facade makes this cheap. If Baileys proves unworkable after deployment:
