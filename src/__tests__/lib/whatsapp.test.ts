@@ -1839,6 +1839,31 @@ describe('spec 3.8: socket death without a close event (connect watchdog)', () =
         expect(state.makeWASocket).toHaveBeenCalledTimes(1);
     });
 
+    // Added by the pipeline LEAD after production showed the watchdog killing a healthy
+    // socket mid-pairing. An unpaired socket never reaches 'open' by definition — it is
+    // waiting for a human — so a QR arriving is the liveness proof, and the watchdog must
+    // reset on it rather than cut the pairing window off at 90s from the socket opening.
+    it('3.8 a QR resets the watchdog, so a socket being handed fresh QRs is not killed mid-pairing', async () => {
+        const { svc, state } = await loadUnpaired();
+
+        // Just short of the deadline, then a fresh QR arrives (as WhatsApp refreshes refs).
+        await advance(WATCHDOG_MS - 1);
+        conn(state, 0, { qr: 'second-ref' });
+        expect(svc.latestQR).toBe('second-ref');
+
+        // Without the reset the watchdog would fire 1ms from here and release the socket.
+        await advance(WATCHDOG_MS - 1);
+        expect(state.sockets[0].end).not.toHaveBeenCalled();
+        expect(svc.getStatus().consecutiveInitFailures).toBe(0);
+        expect(svc.latestQR).toBe('second-ref'); // still scannable
+
+        // The watchdog still works: it fires 90s after the LAST sign of life.
+        await advance(1);
+        expect(state.sockets[0].end).toHaveBeenCalledWith(undefined);
+        expect(svc.latestQR).toBeNull();
+        expect(alertReasons()).toEqual([]); // unpaired: still no alert
+    });
+
     it('3.8 a registered socket that goes silent: alert connect_watchdog AND a scheduled reconnect', async () => {
         const { svc, state } = await loadPaired();
 
