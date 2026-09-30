@@ -588,6 +588,23 @@ class WhatsAppService {
         if (qr) {
             console.log(`[WA:qr] New QR code received (length: ${qr.length}). Awaiting scan.`);
             this.latestQR = qr;
+            // A QR arriving PROVES the socket is alive, so reset the watchdog rather than
+            // let it kill a healthy socket mid-pairing. The watchdog exists to catch a
+            // socket that never gets anywhere; one that is being handed fresh QR refs by
+            // WhatsApp is getting somewhere, it is just waiting for a human.
+            //
+            // Without this the pairing window is 90s from the socket opening, which it
+            // cut off after the third QR in production on 2026-09-30 — an admin who opens
+            // /admin, logs in, and reaches for their phone can easily lose that race, and
+            // the failure is silent: the code on screen simply stops working.
+            //
+            // Not unbounded, and deliberately not our bound to own: Baileys ends the
+            // socket itself once the QR refs are exhausted, with
+            // `end(Boom('QR refs attempts ended', { statusCode: DisconnectReason.timedOut }))`
+            // (lib/Socket/socket.js:716). The first ref lives 60s and later ones 20s, so
+            // the real pairing window is ~160s and its end arrives as an ordinary close,
+            // which onClose() already handles as an unpaired stand-down.
+            this.armConnectWatchdog(sock);
         }
 
         if (isNewLogin) {
