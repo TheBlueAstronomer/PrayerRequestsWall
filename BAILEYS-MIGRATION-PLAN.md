@@ -533,6 +533,120 @@ throwing" — that is the July bug, and acceptance criterion 7 forbids it.
 
 ---
 
+## 7c. S3 and S5 outcomes, and the boot verification (2026-09-30)
+
+| Story | State |
+|---|---|
+| S1 spike | Done |
+| S2 connection lifecycle | Done, reviewed, four findings fixed |
+| S3 send + delivery | **Done. Review verdict SHIP**, no defect in the code; two of seven deployment risks fixed |
+| S4 | Folded into S5 |
+| S5 image slimming | **Done**, plus the deploy-pipeline fix below |
+| S6 deploy + pair | Next - this is the QR scan |
+
+### S3 outcome
+
+380 tests pass. The tester wrote 136 new tests covering all 16 spec edge cases and ran 60
+mutations, 59 of which turned the suite red; the single survivor came with a correct
+equivalence proof rather than an excuse. The reviewer verified the group-ack premise against
+the library itself rather than trusting the handoffs, and returned SHIP.
+
+Two review risks were fixed in commit `104e1d2`:
+
+- **nginx had no `proxy_read_timeout`**, so its 60s default applied, not the 62s the code
+  comment assumed - that number came from a 504 latency observed during the 2026-08-07
+  outage, not from anything configured. Verified against production: `whatsapp_group_ids`
+  holds exactly **one** group and the VM env file sets no `WA_ACK_TIMEOUT_MS`, so today's
+  worst case is 30s and fits comfortably. The fix is about the cliff, not the present: two
+  groups would be 60s, three would always fail, and nothing caps the count. Now 90s.
+- **A negative env timeout was truthy**, surviving the `|| DEFAULT` and yielding a timer that
+  fires immediately - every send reporting a timeout while messages arrived fine, which is
+  the July shape, reachable from one typo. Both timeouts are now floored at 1s.
+
+One test of mine had to be rewritten because it could not fail: a `mockResolvedValue` relay
+wins the `Promise.race` as a microtask regardless of how small the timer is, so the
+relay-floor test passed even with the floor removed. It now parks the relay, and a red
+control confirms removing only that floor fails only that test.
+
+### The boot verification passed, closing plan 7a's open check
+
+The dynamic `import()` of Baileys is the one line no test can cover: under `ts-jest`
+`await import()` compiles to `require()`, which is how the Jest mock intercepts it at all,
+while under `tsx` in production it must stay a genuine dynamic import. Opposite mechanisms.
+
+The local Docker daemon was unavailable, so this ran as a throwaway Cloud Build
+(`1bad7def-4fab-4bc2-a650-2934a6e7634c`) that built the real image and booted it - a closer
+match to production than the Windows/Node 24 check the coder had managed. It deployed nothing
+and did not scan the QR. Result: SUCCESS.
+
+| Check | Result |
+|---|---|
+| Server boots on `node:20-bookworm-slim` under `tsx` | `> Ready on http://localhost:3000` |
+| Baileys loads and connects | `[WA:qr] New QR code received (length: 277)` |
+| Memory under the real 768m cap | **265.4 MB** (baseline ~1.4 GB) |
+| Browser on PATH, puppeteer cache, puppeteer module | none of the three |
+| `wget` present | yes, and the healthcheck depends on it |
+| npm lifecycle scripts ran (R7) | `engine-requirements.js`, `protobufjs postinstall` |
+| Chrome downloaded during the build | **zero** |
+
+265 MB measured idle gives the 768m cap roughly 3x headroom, so tightening to 512m later is
+safe but not urgent - the point was getting off 1600m.
+
+### The deploy pipeline never shipped the nginx config
+
+Found while checking whether the `proxy_read_timeout` fix would actually reach production. It
+would not have. `cloudbuild.yaml` copied **only** `docker-compose.prod.yml` to the VM, even
+though that file bind-mounts `./nginx/conf.d` into the nginx container. So the VM's nginx
+config was hand-maintained and the repo was never really its source of truth. The two
+happened to be byte-identical as of today, verified by diff ignoring line endings, so nothing
+was broken - but any nginx change committed here would have silently gone nowhere.
+
+Fixed in `318b1c1`: the deploy now copies the config, validates it with `nginx -t` **before**
+anything is recreated, so an invalid config fails the build while the running nginx keeps
+serving what it already loaded, then applies it with a graceful reload. The test is wrapped
+in an `if` on the container's existence, because `if` returns its body's status - a failing
+validation still stops the deploy, while a missing container on a fresh VM does not.
+
+The VM's config was also world-writable, mode 666 inside a 777 directory, the same hygiene
+problem the env file had before it was locked down. The deploy now sets it to 644.
+
+### Host prerequisites, done
+
+- `/var/intercessor/data/baileys_auth` created, owned 1000:1000, mode 700.
+- `/var/intercessor/data/wwebjs_auth` (52 MB) deliberately left untouched for rollback.
+- Disk at 18%, 78 GB free.
+
+### Outstanding, deliberately
+
+- **`.env.example` is not updated.** The permission system denies access to env-file paths,
+  which is a sensible guardrail and was not worked around. A ready patch script sits at
+  `scratchpad/handoff/s5-env-example-patch.py`; it documents `WA_AUTH_PATH`, `WA_LOG_LEVEL`,
+  the corrected `WA_ACK_TIMEOUT_MS` default of 20000 and the new `WA_SEND_RELAY_TIMEOUT_MS`,
+  and removes the dead `WA_QR_MAX_RETRIES`. Documentation only, no runtime effect.
+- **No alert exists for "connected but every send fails."** `wa_session_lost` covers session
+  loss only. Three log lines are stable and distinct - `No acknowledgement from WhatsApp`,
+  `WhatsApp REJECTED the message`, `completed AFTER its` - so one Cloud Logging metric closes
+  it. To be added at S6, once real log lines exist to match against.
+- **Every group send performs an uncached `groupMetadata` iq**, since no `cachedGroupMetadata`
+  is passed, plus device and session fetches across roughly 62 participants. On a cold session
+  that can approach the 10s relay deadline and produce `false` for a message that probably
+  arrived. Watch for `completed AFTER its 10000ms deadline` in the first week;
+  `WA_SEND_RELAY_TIMEOUT_MS` raises it with no code change.
+- **`whatsappSent` and Resend are all-or-nothing across groups.** With one group configured
+  this cannot bite today, but with two, one slow group means the healthy group gets a
+  duplicate on the first Resend click.
+
+### The S6 instruction that matters most
+
+If the log shows `No acknowledgement from WhatsApp` **while the phone shows the message
+arriving**, do **not** press Resend - it double-posts. That pattern means the send worked and
+only the confirmation signal is missing, which is the contingency in section 7b: add
+`message-receipt.update` as a third accept signal. Note it is not a bounded-latency
+substitute, because for a group it only fires once some participant's device has the message,
+so `WA_ACK_TIMEOUT_MS` likely has to rise alongside it.
+
+---
+
 ## 8. Rollback
 
 The facade makes this cheap. If Baileys proves unworkable after deployment:
